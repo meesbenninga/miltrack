@@ -1,0 +1,14 @@
+bundle:
+  name: miltrack
+
+targets:
+  dev:
+    mode: development
+    default: true
+
+resources:
+  apps:
+    miltrack:
+      name: miltrack
+      description: "Live military aircraft tracker — ADS-B + ACLED conflict data"
+      source_code_path: ./
