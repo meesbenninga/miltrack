@@ -70,6 +70,12 @@ if [ -f .env ]; then
     databricks secrets put-secret "${SECRET_SCOPE}" "ucdp-access-token" --string-value "${UCDP_TOKEN}"
     echo "  OK: ucdp-access-token stored"
   fi
+  FA_KEY=$(grep "^FLIGHTAWARE_API_KEY=" .env | cut -d'=' -f2-)
+  if [ -n "${FA_KEY}" ] && [ "${FA_KEY}" != "your-flightaware-key" ]; then
+    echo "  Storing FlightAware API key in secret scope..."
+    databricks secrets put-secret "${SECRET_SCOPE}" "flightaware-api-key" --string-value "${FA_KEY}"
+    echo "  OK: flightaware-api-key stored"
+  fi
 else
   echo "  WARN: No .env file found. Set secrets manually:"
   echo "    databricks secrets put-secret ${SECRET_SCOPE} brave-api-key"
@@ -111,7 +117,7 @@ else
 fi
 
 # Configure app resources (secrets) programmatically — no manual UI needed
-echo "  Configuring app resources (brave_api_key, ucdp_access_token)..."
+echo "  Configuring app resources (brave_api_key, ucdp_access_token, flightaware_api_key)..."
 RESOURCES_JSON=$(cat <<EOF
 {
   "resources": [
@@ -128,6 +134,14 @@ RESOURCES_JSON=$(cat <<EOF
       "secret": {
         "scope": "${SECRET_SCOPE}",
         "key": "ucdp-access-token",
+        "permission": "READ"
+      }
+    },
+    {
+      "name": "flightaware_api_key",
+      "secret": {
+        "scope": "${SECRET_SCOPE}",
+        "key": "flightaware-api-key",
         "permission": "READ"
       }
     }

@@ -33,13 +33,14 @@ import {
   type SitrepResponse,
   fetchDeathToll,
   type DeathTollResponse,
+  type DeathTollPreset,
+  fetchFlightAwareRoute,
+  type FlightAwareResponse,
 } from "./tracker-api";
 import iranGeoJson from "./iran.geo.json";
 import israelGeoJson from "./israel.geo.json";
 
-const ME_CENTER: [number, number] = [32.0, 44.0];
 const GLOBAL_CENTER: [number, number] = [25.0, 30.0];
-const ME_ZOOM = 5;
 const GLOBAL_ZOOM = 3;
 const AC_REFRESH = 15_000;
 const TRAIL_REFRESH = 10_000;
@@ -306,6 +307,9 @@ function SidePanel({
   playbackPlaying,
   onPlaybackPlayingChange,
   playbackPosition,
+  faRoute,
+  faLoading,
+  onLoadFlightAware,
 }: {
   aircraft: AircraftPosition;
   trail: TrailPoint[];
@@ -315,6 +319,9 @@ function SidePanel({
   playbackPlaying: boolean;
   onPlaybackPlayingChange: (v: boolean) => void;
   playbackPosition: { lat: number; lon: number; alt: number | null } | null;
+  faRoute: FlightAwareResponse | null;
+  faLoading: boolean;
+  onLoadFlightAware: () => void;
 }) {
   const [info, setInfo] = useState<AircraftInfo | null>(null);
   const [infoLoading, setInfoLoading] = useState(false);
@@ -533,6 +540,106 @@ function SidePanel({
           <div style={{ fontSize: 10, color: "#8888a0", marginTop: 4 }}>
             Up to 60 min history · refreshes every 10s
           </div>
+          <button
+            type="button"
+            disabled={faLoading}
+            onClick={onLoadFlightAware}
+            style={{
+              marginTop: 8,
+              width: "100%",
+              padding: "8px 12px",
+              background: faRoute?.positions?.length ? "#1e3a5f" : "#1a1a2a",
+              border: `1px solid ${faRoute?.positions?.length ? "#3b82f6" : "#2a2a3a"}`,
+              borderRadius: 6,
+              color: faRoute?.positions?.length ? "#93c5fd" : "#e4e4ef",
+              cursor: faLoading ? "wait" : "pointer",
+              fontSize: 11,
+              fontWeight: 600,
+              display: "flex",
+              alignItems: "center",
+              justifyContent: "center",
+              gap: 6,
+            }}
+          >
+            {faLoading ? "Loading..." : faRoute?.positions?.length ? `✓ Full Route · ${faRoute.total} points` : "Full Route (FlightAware)"}
+          </button>
+          {faRoute && (
+            <div style={{ fontSize: 10, marginTop: 4, lineHeight: 1.6 }}>
+              {faRoute.positions.length > 0 ? (
+                <>
+                  <div style={{ color: "#9ca3af" }}>
+                    {faRoute.origin && faRoute.destination ? `${faRoute.origin} → ${faRoute.destination}` : "Route loaded"}
+                    {faRoute.route_distance ? ` · ${faRoute.route_distance}` : ""}
+                  </div>
+                  {faRoute.progress_percent != null && (
+                    <div style={{ marginTop: 4 }}>
+                      <div style={{ display: "flex", justifyContent: "space-between", fontSize: 10, color: "#9ca3af", marginBottom: 2 }}>
+                        <span>Progress</span>
+                        <span>{faRoute.progress_percent}%</span>
+                      </div>
+                      <div style={{ height: 4, background: "#1a1a2a", borderRadius: 2, overflow: "hidden" }}>
+                        <div style={{ height: "100%", width: `${faRoute.progress_percent}%`, background: "#3b82f6", borderRadius: 2 }} />
+                      </div>
+                    </div>
+                  )}
+                  {(faRoute.departure_time || faRoute.arrival_time || faRoute.estimated_arrival) && (
+                    <div style={{ color: "#9ca3af", marginTop: 4, display: "grid", gridTemplateColumns: "1fr 1fr", gap: "2px 12px" }}>
+                      {faRoute.departure_time && (
+                        <>
+                          <span style={{ color: "#6b7280" }}>Departed</span>
+                          <span>{new Date(faRoute.departure_time).toLocaleTimeString("en-GB", { hour: "2-digit", minute: "2-digit", timeZoneName: "short" })}</span>
+                        </>
+                      )}
+                      {(faRoute.arrival_time || faRoute.estimated_arrival) && (
+                        <>
+                          <span style={{ color: "#6b7280" }}>{faRoute.arrival_time ? "Arrived" : "ETA"}</span>
+                          <span>{new Date((faRoute.arrival_time || faRoute.estimated_arrival)!).toLocaleTimeString("en-GB", { hour: "2-digit", minute: "2-digit", timeZoneName: "short" })}</span>
+                        </>
+                      )}
+                      {faRoute.filed_ete != null && (
+                        <>
+                          <span style={{ color: "#6b7280" }}>Duration</span>
+                          <span>{Math.floor(faRoute.filed_ete / 3600)}h {Math.floor((faRoute.filed_ete % 3600) / 60)}m</span>
+                        </>
+                      )}
+                    </div>
+                  )}
+                  {(faRoute.filed_altitude || faRoute.filed_airspeed) && (
+                    <div style={{ color: "#9ca3af", marginTop: 4, display: "grid", gridTemplateColumns: "1fr 1fr", gap: "2px 12px" }}>
+                      {faRoute.filed_altitude != null && (
+                        <>
+                          <span style={{ color: "#6b7280" }}>Filed alt</span>
+                          <span>FL{faRoute.filed_altitude / 100}</span>
+                        </>
+                      )}
+                      {faRoute.filed_airspeed != null && (
+                        <>
+                          <span style={{ color: "#6b7280" }}>Filed speed</span>
+                          <span>{faRoute.filed_airspeed} kts</span>
+                        </>
+                      )}
+                    </div>
+                  )}
+                  {(faRoute.operator || faRoute.owner || faRoute.status) && (
+                    <div style={{ color: "#6b7280", marginTop: 4 }}>
+                      {faRoute.operator ? `Operator: ${faRoute.operator}` : ""}
+                      {faRoute.owner ? `${faRoute.operator ? " · " : ""}Owner: ${faRoute.owner}` : ""}
+                      {faRoute.status ? `${faRoute.operator || faRoute.owner ? " · " : ""}${faRoute.status}` : ""}
+                    </div>
+                  )}
+                  {faRoute.filed_route && (
+                    <div style={{ color: "#6b7280", marginTop: 4, wordBreak: "break-all" }}>
+                      Route: {faRoute.filed_route}
+                    </div>
+                  )}
+                </>
+              ) : faRoute.blocked ? (
+                <span style={{ color: "#ef4444" }}>Blocked — military aircraft are often hidden on FlightAware</span>
+              ) : (
+                <span style={{ color: "#f59e0b" }}>{faRoute.message || "No route data available"}</span>
+              )}
+            </div>
+          )}
         </div>
 
         {/* Playback of flight */}
@@ -685,6 +792,16 @@ function FollowAircraft({ position }: { position: [number, number] | null }) {
   return null;
 }
 
+function FitRouteBounds({ positions }: { positions: [number, number][] | null }) {
+  const map = useMap();
+  useEffect(() => {
+    if (!positions || positions.length < 2) return;
+    const bounds = L.latLngBounds(positions.map(([lat, lon]) => L.latLng(lat, lon)));
+    map.fitBounds(bounds, { padding: [60, 60], maxZoom: 12, animate: true, duration: 0.8 });
+  }, [map, positions]);
+  return null;
+}
+
 // ---------------------------------------------------------------------------
 // App
 // ---------------------------------------------------------------------------
@@ -695,7 +812,6 @@ export function App() {
   const [bases, setBases] = useState<MilitaryBase[]>([]);
   const [loading, setLoading] = useState(false);
   const [lastUpdate, setLastUpdate] = useState("--");
-  const [globalView, setGlobalView] = useState(true);
   const [acVisible, setAcVisible] = useState<Record<MilCategory, boolean>>({
     tanker: true,
     awacs: true,
@@ -706,13 +822,16 @@ export function App() {
   const [countryFilter, setCountryFilter] = useState<Record<string, boolean>>({});
   const [countryFilterOpen, setCountryFilterOpen] = useState(false);
   const [showStrikes, setShowStrikes] = useState(true);
-  const [strikeDays, setStrikeDays] = useState(90);
   const [showBases, setShowBases] = useState(false);
   const [hints, setHints] = useState<string[]>([]);
   const [hintsVisible, setHintsVisible] = useState(true);
 
   const [selectedHex, setSelectedHex] = useState<string | null>(null);
   const [trail, setTrail] = useState<TrailPoint[]>([]);
+  const [faRoute, setFaRoute] = useState<FlightAwareResponse | null>(null);
+  const [faLoading, setFaLoading] = useState(false);
+  const [fitBoundsPositions, setFitBoundsPositions] = useState<[number, number][] | null>(null);
+  const faCacheRef = useRef<Map<string, FlightAwareResponse>>(new Map());
   const [followPos, setFollowPos] = useState<[number, number] | null>(null);
   const [searchQuery, setSearchQuery] = useState("");
   const [searchFocused, setSearchFocused] = useState(false);
@@ -738,6 +857,8 @@ export function App() {
   const [deathToll, setDeathToll] = useState<DeathTollResponse | null>(null);
   const [showDeathTollModal, setShowDeathTollModal] = useState(false);
   const [expandedDeathTollCountry, setExpandedDeathTollCountry] = useState<string | null>(null);
+  const [deathTollPreset, setDeathTollPreset] = useState<DeathTollPreset>("30d");
+  const [deathTollLoading, setDeathTollLoading] = useState(false);
 
   useEffect(() => {
     if (!showDeathTollModal) setExpandedDeathTollCountry(null);
@@ -751,7 +872,7 @@ export function App() {
   const loadAircraft = useCallback(async () => {
     setLoading(true);
     try {
-      const d = await fetchAircraft(globalView);
+      const d = await fetchAircraft(true);
       setAircraft(d.aircraft);
       setLastUpdate(new Date().toLocaleTimeString());
     } catch (e) {
@@ -759,11 +880,11 @@ export function App() {
     } finally {
       setLoading(false);
     }
-  }, [globalView]);
+  }, []);
 
   const loadStrikes = useCallback(async () => {
     try {
-      const d = await fetchStrikes({ days: strikeDays });
+      const d = await fetchStrikes({ days: 90 });
       setStrikes(d.events);
       setStrikesEnriched(d.enriched);
       setStrikesUpdatedAt(new Date());
@@ -771,16 +892,16 @@ export function App() {
     } catch (e) {
       console.error(e);
     }
-  }, [strikeDays]);
+  }, []);
 
   const loadBases = useCallback(async () => {
     try {
-      const d = await fetchBases(globalView);
+      const d = await fetchBases(true);
       setBases(d.bases);
     } catch (e) {
       console.error(e);
     }
-  }, [globalView]);
+  }, []);
 
   const loadNews = useCallback(async () => {
     try {
@@ -818,17 +939,25 @@ export function App() {
     }
   }, []);
 
-  const loadDeathToll = useCallback(async () => {
+  const loadDeathToll = useCallback(async (preset?: DeathTollPreset) => {
+    const p = preset ?? deathTollPreset;
+    setDeathTollLoading(true);
     try {
-      const d = await fetchDeathToll();
+      const d = await fetchDeathToll(p);
       if (d.by_country.length > 0) setDeathToll(d);
     } catch {
       // Death toll not available
+    } finally {
+      setDeathTollLoading(false);
     }
-  }, []);
+  }, [deathTollPreset]);
+
+  const faRouteRef = useRef(faRoute);
+  faRouteRef.current = faRoute;
 
   const loadTrail = useCallback(async () => {
     if (!selectedHex) return;
+    if (faRouteRef.current && faRouteRef.current.positions.length > 0) return;
     try {
       const d = await fetchTrail(selectedHex);
       setTrail(d.points);
@@ -862,16 +991,19 @@ export function App() {
   }, [loadAircraft, loadStrikes, loadBases, loadNews, loadIntel, loadSitrep, loadDeathToll]);
 
   useEffect(() => {
+    setFaRoute(null);
+    setFitBoundsPositions(null);
+    setTrail([]);
     if (selectedHex) {
       loadTrail();
       trailTimer.current = setInterval(loadTrail, TRAIL_REFRESH);
-    } else {
-      setTrail([]);
     }
     return () => {
       if (trailTimer.current) clearInterval(trailTimer.current);
     };
-  }, [selectedHex, loadTrail]);
+    // only re-run when aircraft selection changes, not on loadTrail ref
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [selectedHex]);
 
   // --- Handlers ---
 
@@ -928,7 +1060,11 @@ export function App() {
     [trail],
   );
 
-  const selectedAc = selectedHex ? aircraft.find((a) => a.hex === selectedHex) : null;
+  const liveSelectedAc = selectedHex ? aircraft.find((a) => a.hex === selectedHex) : null;
+  const lastSelectedAcRef = useRef<AircraftPosition | null>(null);
+  if (liveSelectedAc) lastSelectedAcRef.current = liveSelectedAc;
+  const selectedAc = selectedHex ? (liveSelectedAc ?? lastSelectedAcRef.current) : null;
+  if (!selectedHex) lastSelectedAcRef.current = null;
   const selectedCat = selectedAc ? classifyAircraft(selectedAc) : null;
   const panelOpen = selectedAc != null || showTable || showNews;
 
@@ -965,18 +1101,19 @@ export function App() {
       return;
     }
     if (playbackPosition) {
+      if (fitBoundsPositions) setFitBoundsPositions(null);
       setFollowPos([playbackPosition.lat, playbackPosition.lon]);
     } else {
       const ac = aircraft.find((a) => a.hex === selectedHex);
       if (ac?.lat != null && ac?.lon != null) setFollowPos([ac.lat, ac.lon]);
     }
-  }, [aircraft, selectedHex, playbackPosition]);
+  }, [aircraft, selectedHex, playbackPosition, fitBoundsPositions]);
 
   useEffect(() => {
     if (!selectedHex) setPlaybackTs(null);
   }, [selectedHex]);
 
-  // Iran conflict aircraft — scored by involvement level, sorted descending
+  // Middle East conflict aircraft — scored by involvement level, sorted descending
   const conflictAircraft = useMemo(() => {
     const CONFLICT_COUNTRIES = new Set(["US", "IL", "GB", "FR", "DE", "SA", "AE", "BH", "QA"]);
     return aircraft
@@ -1029,8 +1166,8 @@ export function App() {
     <div style={{ position: "relative", height: "100%", width: "100%" }}>
       {/* Map */}
       <MapContainer
-        center={globalView ? GLOBAL_CENTER : ME_CENTER}
-        zoom={globalView ? GLOBAL_ZOOM : ME_ZOOM}
+        center={GLOBAL_CENTER}
+        zoom={GLOBAL_ZOOM}
         zoomControl={false}
         style={{ height: "100%", width: "100%" }}
       >
@@ -1064,17 +1201,18 @@ export function App() {
         />
         <ZoomControl />
         <MapClickHandler onDeselect={deselectAll} />
-        <FollowAircraft position={followPos} />
+        <FollowAircraft position={fitBoundsPositions ? null : followPos} />
+        <FitRouteBounds positions={fitBoundsPositions} />
 
-        {/* Trail polyline */}
-        {trailPositions.length > 1 && selectedCat && (
+        {/* Trail polyline — solid blue for FlightAware full route, dashed for local trail */}
+        {trailPositions.length > 1 && (selectedCat || faRoute?.positions?.length) && (
           <Polyline
             positions={trailPositions}
             pathOptions={{
-              color: CATEGORY_META[selectedCat].color,
-              weight: 3,
+              color: faRoute?.positions?.length ? "#3b82f6" : selectedCat ? CATEGORY_META[selectedCat].color : "#3b82f6",
+              weight: faRoute?.positions?.length ? 2.5 : 3,
               opacity: 0.75,
-              dashArray: "8 4",
+              dashArray: faRoute?.positions?.length ? undefined : "8 4",
             }}
           />
         )}
@@ -1308,6 +1446,38 @@ export function App() {
             playbackPlaying={playbackPlaying}
             onPlaybackPlayingChange={setPlaybackPlaying}
             playbackPosition={playbackPosition}
+            faRoute={faRoute}
+            faLoading={faLoading}
+            onLoadFlightAware={async () => {
+              const ident = selectedAc.flight?.trim() || selectedAc.registration?.trim();
+              if (!ident) return;
+              const cacheKey = `${ident}:${selectedAc.registration || ""}`.toUpperCase();
+              const cached = faCacheRef.current.get(cacheKey);
+              if (cached) {
+                setFaRoute(cached);
+                setTrail(cached.positions);
+                if (cached.positions.length > 0) {
+                  setFitBoundsPositions(cached.positions.map((p) => [p.lat, p.lon] as [number, number]));
+                }
+                return;
+              }
+              setFaLoading(true);
+              try {
+                const d = await fetchFlightAwareRoute(ident, selectedAc.registration || undefined);
+                if (d.positions.length > 0) {
+                  faCacheRef.current.set(cacheKey, d);
+                }
+                setFaRoute(d);
+                if (d.positions.length > 0) {
+                  setTrail(d.positions);
+                  setFitBoundsPositions(d.positions.map((p) => [p.lat, p.lon] as [number, number]));
+                }
+              } catch {
+                setFaRoute({ ident, positions: [], total: 0, fa_flight_id: null, origin: null, destination: null, aircraft_type: null, route_distance: null, owner: null, operator: null, operator_icao: null, status: null, blocked: false, available: false, message: "FlightAware unavailable — try again later", departure_time: null, arrival_time: null, estimated_arrival: null, filed_ete: null, progress_percent: null, filed_altitude: null, filed_airspeed: null, filed_route: null, registration: null });
+              } finally {
+                setFaLoading(false);
+              }
+            }}
           />
         )}
       </div>
@@ -1320,7 +1490,7 @@ export function App() {
         >
           <div className="side-panel-header">
             <span style={{ fontWeight: 700, fontSize: 16, letterSpacing: 1 }}>
-              {showTable ? "IRAN CONFLICT — AIRCRAFT" : showSitrep ? "AI SITUATION REPORT" : intelAvailable ? "AI INTELLIGENCE FEED" : "MILITARY NEWS FEED"}
+              {showTable ? "MIDDLE EAST CONFLICT — AIRCRAFT" : showSitrep ? "AI SITUATION REPORT" : intelAvailable ? "AI INTELLIGENCE FEED" : "MILITARY NEWS FEED"}
             </span>
             <button
               className="sp-close"
@@ -1333,7 +1503,7 @@ export function App() {
             {showTable && (
               <>
                 <div style={{ fontSize: 12, color: "#8888a0", marginBottom: 6, lineHeight: 1.5 }}>
-                  Coalition aircraft ranked by how likely they are involved in the Iran conflict ({conflictAircraft.length} tracked).
+                  Coalition aircraft ranked by how likely they are involved in the Middle East conflict ({conflictAircraft.length} tracked).
                 </div>
                 <details style={{ marginBottom: 12, fontSize: 11, color: "#6b7280", background: "#0d0d15", border: "1px solid #1a1a2a", borderRadius: 6, padding: 0 }}>
                   <summary style={{ padding: "6px 10px", cursor: "pointer", color: "#8888a0", fontWeight: 600, letterSpacing: 0.5 }}>How the conflict score works</summary>
@@ -1864,7 +2034,8 @@ export function App() {
                   }}
                 >
                   <b style={{ ...mono, color: "#dc2626", fontSize: 12 }}>{total.toLocaleString()}</b>
-                  <span style={{ color: "#9ca3af", fontSize: 11 }}>deaths</span>
+                  <span style={{ color: "#9ca3af", fontSize: 11 }}>casualties</span>
+                  <span style={{ color: "#6b7280", fontSize: 9 }}>({deathTollPreset === "30d" ? "30d" : deathTollPreset === "90d" ? "90d" : deathTollPreset === "ytd" ? "YTD" : deathTollPreset === "2024" ? "2024" : "all"})</span>
                   <span style={{ fontSize: 10, color: "#6b7280", marginLeft: 2 }}>▼</span>
                 </button>
               </>
@@ -1883,10 +2054,6 @@ export function App() {
             }}
           />
           <span style={{ color: "#8888a0" }}>{lastUpdate}</span>
-          <D />
-          <button onClick={() => setGlobalView(!globalView)} style={toggleBtnStyle}>
-            {globalView ? "GLOBAL" : "MIDDLE EAST"}
-          </button>
           <D />
           <button
             onClick={() => { setShowTable(!showTable); setShowNews(false); setShowSitrep(false); }}
@@ -1947,7 +2114,7 @@ export function App() {
               border: "1px solid #2a2a3a",
               borderRadius: 12,
               padding: 24,
-              maxWidth: 420,
+              maxWidth: 460,
               width: "90vw",
               maxHeight: "80vh",
               overflowY: "auto",
@@ -1955,31 +2122,69 @@ export function App() {
             }}
             onClick={(e) => e.stopPropagation()}
           >
-            <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 16 }}>
-              <h3 style={{ margin: 0, fontSize: 18, fontWeight: 700, color: "#e4e4ef" }}>Death toll by country</h3>
-              {expandedDeathTollCountry && (
-                <button type="button" onClick={() => setExpandedDeathTollCountry(null)} style={{ background: "none", border: "none", color: "#8888a0", cursor: "pointer", fontSize: 11 }}>Collapse</button>
-              )}
-              <button
-                type="button"
-                onClick={() => setShowDeathTollModal(false)}
-                style={{
-                  background: "none",
-                  border: "none",
-                  color: "#8888a0",
-                  cursor: "pointer",
-                  fontSize: 20,
-                  padding: 4,
-                  lineHeight: 1,
-                }}
-              >
-                ×
-              </button>
+            <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 12 }}>
+              <h3 style={{ margin: 0, fontSize: 18, fontWeight: 700, color: "#e4e4ef" }}>Conflict casualties</h3>
+              <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
+                {expandedDeathTollCountry && (
+                  <button type="button" onClick={() => setExpandedDeathTollCountry(null)} style={{ background: "none", border: "none", color: "#8888a0", cursor: "pointer", fontSize: 11 }}>Collapse</button>
+                )}
+                <button
+                  type="button"
+                  onClick={() => setShowDeathTollModal(false)}
+                  style={{
+                    background: "none",
+                    border: "none",
+                    color: "#8888a0",
+                    cursor: "pointer",
+                    fontSize: 20,
+                    padding: 4,
+                    lineHeight: 1,
+                  }}
+                >
+                  ×
+                </button>
+              </div>
             </div>
-            <div style={{ fontSize: 11, color: "#6b7280", marginBottom: 16, lineHeight: 1.4 }}>
-              {deathToll.ucdp_available ? "UCDP verified + GDELT" : "GDELT (AI-enriched)"} · {deathToll.period}
+
+            {/* Time period selector */}
+            <div style={{ display: "flex", gap: 4, marginBottom: 12, flexWrap: "wrap" }}>
+              {([
+                ["30d", "30 days"],
+                ["90d", "90 days"],
+                ["ytd", "YTD"],
+                ["2024", "2024"],
+                ["all", "Since Oct 7 '23"],
+              ] as [DeathTollPreset, string][]).map(([key, label]) => (
+                <button
+                  key={key}
+                  type="button"
+                  onClick={() => {
+                    setDeathTollPreset(key);
+                    loadDeathToll(key);
+                  }}
+                  style={{
+                    padding: "4px 10px",
+                    fontSize: 11,
+                    fontWeight: deathTollPreset === key ? 600 : 400,
+                    borderRadius: 6,
+                    border: `1px solid ${deathTollPreset === key ? "#3b82f6" : "#2a2a3a"}`,
+                    background: deathTollPreset === key ? "#1e3a5f" : "#1a1a2a",
+                    color: deathTollPreset === key ? "#93c5fd" : "#9ca3af",
+                    cursor: "pointer",
+                    transition: "all 0.15s",
+                  }}
+                >
+                  {label}
+                </button>
+              ))}
             </div>
-            <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
+
+            <div style={{ fontSize: 11, color: "#6b7280", marginBottom: 14, lineHeight: 1.4 }}>
+              {deathToll.ucdp_available ? <><a href="https://ucdp.uu.se/" target="_blank" rel="noopener noreferrer" style={{ color: "#3b82f6" }}>UCDP</a> (Uppsala Conflict Data Program) + <a href="https://www.gdeltproject.org/" target="_blank" rel="noopener noreferrer" style={{ color: "#3b82f6" }}>GDELT</a> (Global Database of Events, Language, and Tone)</> : <><a href="https://www.gdeltproject.org/" target="_blank" rel="noopener noreferrer" style={{ color: "#3b82f6" }}>GDELT</a> (Global Database of Events, Language, and Tone — AI-enriched)</>} · {deathToll.period}
+              {deathTollLoading && <span style={{ marginLeft: 8, color: "#3b82f6" }}>Loading...</span>}
+            </div>
+
+            <div style={{ display: "flex", flexDirection: "column", gap: 8, opacity: deathTollLoading ? 0.5 : 1, transition: "opacity 0.2s" }}>
               {deathToll.by_country.map((row) => {
                 const isExpanded = expandedDeathTollCountry === row.country;
                 const hasUcdp = row.ucdp_best != null && row.ucdp_best > 0;
@@ -2011,14 +2216,19 @@ export function App() {
                         textAlign: "left",
                       }}
                     >
-                      <span style={{ color: "#e4e4ef", fontWeight: 600, fontSize: 14 }}>{row.country}</span>
-                      <span style={{ display: "flex", alignItems: "center", gap: 8 }}>
+                      <div style={{ display: "flex", flexDirection: "column", gap: 2 }}>
+                        <span style={{ color: "#e4e4ef", fontWeight: 600, fontSize: 14 }}>{row.country}</span>
+                        {row.conflict_context && (
+                          <span style={{ fontSize: 10, color: "#6b7280", fontStyle: "italic" }}>{row.conflict_context}</span>
+                        )}
+                      </div>
+                      <span style={{ display: "flex", alignItems: "center", gap: 8, flexShrink: 0 }}>
                         {hasUcdp && (
                           <span style={{ color: "#22c55e", fontWeight: 700, fontSize: 15, fontVariantNumeric: "tabular-nums" }}>
                             {row.ucdp_best!.toLocaleString()}
                             {row.ucdp_low != null && row.ucdp_high != null && row.ucdp_low !== row.ucdp_high && (
                               <span style={{ fontSize: 11, color: "#6b7280", fontWeight: 400, marginLeft: 6 }}>
-                                ({row.ucdp_low}–{row.ucdp_high})
+                                ({row.ucdp_low.toLocaleString()}–{row.ucdp_high.toLocaleString()})
                               </span>
                             )}
                           </span>
@@ -2066,13 +2276,13 @@ export function App() {
               })}
             </div>
             <div style={{ marginTop: 16, fontSize: 10, color: "#6b7280", lineHeight: 1.5 }}>
-              Click a country for source details and validation info. By conflict location; US casualties when events identify US as a party.
+              Deaths attributed by location of the event, not nationality of victims. Click a country for source details.
             </div>
             <div style={{ marginTop: 12, padding: 10, background: "#0d0d15", borderRadius: 8, border: "1px solid #2a2a3a", fontSize: 10, color: "#9ca3af", lineHeight: 1.6 }}>
-              <div style={{ fontWeight: 600, color: "#e4e4ef", marginBottom: 6 }}>Compare with news</div>
-              Use BBC Verify, CBS, CNN as benchmarks. Expect differences due to: different time ranges, definitions (confirmed vs estimated), and update timing.
+              <div style={{ fontWeight: 600, color: "#e4e4ef", marginBottom: 6 }}>Important context</div>
+              These figures cover multiple overlapping conflicts in the Middle East region and should not be attributed to a single conflict. Use the time filter above to narrow the period.
               <div style={{ marginTop: 6, color: "#f59e0b" }}>
-                GDELT numbers are AI-inferred and unverified — treat as rough indicators, not official counts.
+                GDELT numbers are AI-inferred and unverified — treat as rough indicators, not official counts. Always cross-reference with official sources.
               </div>
               {!deathToll.ucdp_available && (
                 <div style={{ marginTop: 6 }}>
@@ -2234,30 +2444,10 @@ export function App() {
                 />
               </span>
             </Row>
-            <div
-              style={{
-                marginTop: 8,
-                display: "flex",
-                alignItems: "center",
-                gap: 8,
-                fontSize: 12,
-                color: "#8888a0",
-              }}
-            >
-              <span>Look-back:</span>
-              <select
-                value={strikeDays}
-                onChange={(e) => setStrikeDays(Number(e.target.value))}
-                style={selectStyle}
-              >
-                <option value={7}>7 days</option>
-                <option value={30}>30 days</option>
-                <option value={90}>90 days</option>
-                <option value={180}>6 months</option>
-              </select>
-            </div>
-            <div style={{ fontSize: 10, color: "#666", marginTop: 4, lineHeight: 1.4 }}>
-              {strikes.length} verified incidents ({strikes.filter((e) => e.latitude != null).length} geocoded)
+            <div style={{ fontSize: 10, color: "#666", marginTop: 8, lineHeight: 1.4 }}>
+              {strikes.length} AI-reviewed incidents · last 90 days · Source: <a href="https://www.gdeltproject.org/" target="_blank" rel="noopener noreferrer" style={{ color: "#3b82f6" }}>GDELT</a> (Global Database of Events, Language, and Tone)
+              <br />
+              <span style={{ color: "#b8860b" }}>AI can make mistakes — cross-reference with official sources.</span>
             </div>
             <div style={{ marginTop: 6, display: "flex", flexDirection: "column", gap: 3 }}>
               {([
@@ -2298,7 +2488,7 @@ export function App() {
                 <div style={{ fontSize: 10, color: "#6b7280", marginBottom: 8 }}>
                   Real-time RSS from 10+ sources · newest first · no AI processing (zero cost)
                 </div>
-                <div style={{ maxHeight: 380, overflowY: "auto", paddingRight: 4 }}>
+                <div style={{ maxHeight: 480, overflowY: "auto", paddingRight: 4 }}>
                   {[...news]
                     .sort((a, b) => (b.published || "").localeCompare(a.published || ""))
                     .slice(0, 25)
@@ -2419,14 +2609,6 @@ const sectionTitle: React.CSSProperties = {
   alignItems: "center",
 };
 
-const selectStyle: React.CSSProperties = {
-  background: "#1a1a2a",
-  border: "1px solid #2a2a3a",
-  borderRadius: 4,
-  color: "#e4e4ef",
-  padding: "2px 6px",
-  fontSize: 12,
-};
 
 const toggleBtnStyle: React.CSSProperties = {
   background: "#1a1a2a",

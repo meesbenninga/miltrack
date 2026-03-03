@@ -1,8 +1,9 @@
 """Live military aircraft tracker & conflict event endpoints.
 
 Data sources:
-- adsb.lol /v2/mil — free, unfiltered military ADS-B data
-- OpenSky Network — free ADS-B data (supplements adsb.lol)
+- adsb.lol /v2/mil — free, unfiltered military ADS-B data (primary)
+- airplanes.live /v2/mil — free ADS-B data (fallback for adsb.lol)
+- OpenSky Network — free ADS-B data (supplements primary source)
 - GDELT Project — free, real-time conflict event data (no auth needed)
 - ACLED — curated conflict event data (free registration required)
 - OpenStreetMap / Overpass — military airbase locations (static layer)
@@ -427,6 +428,238 @@ async def get_aircraft_trail(hex_code: str):
     return TrailResponse(hex=code, points=points, total=len(points))
 
 
+class FlightAwareResponse(BaseModel):
+    ident: str
+    positions: list[TrailPoint]
+    total: int
+    fa_flight_id: str | None = None
+    origin: str | None = None
+    destination: str | None = None
+    aircraft_type: str | None = None
+    route_distance: str | None = None
+    owner: str | None = None
+    operator: str | None = None
+    operator_icao: str | None = None
+    status: str | None = None
+    blocked: bool = False
+    available: bool = True
+    message: str | None = None
+    departure_time: str | None = None
+    arrival_time: str | None = None
+    estimated_arrival: str | None = None
+    filed_ete: int | None = None
+    progress_percent: int | None = None
+    filed_altitude: int | None = None
+    filed_airspeed: int | None = None
+    filed_route: str | None = None
+    registration: str | None = None
+
+
+FLIGHTAWARE_BASE = "https://aeroapi.flightaware.com/aeroapi"
+
+
+async def _fa_get(path: str) -> tuple[dict | None, int, str]:
+    """FlightAware request returning (data, status_code, error_detail)."""
+    api_key = os.getenv("FLIGHTAWARE_API_KEY", "").strip()
+    if not api_key or api_key in ("your-flightaware-key", "placeholder"):
+        return None, 0, "API key not configured"
+    try:
+        async with httpx.AsyncClient(timeout=15.0) as client:
+            resp = await client.get(
+                f"{FLIGHTAWARE_BASE}{path}",
+                headers={"x-apikey": api_key},
+            )
+            if resp.status_code == 200:
+                return resp.json(), 200, ""
+            detail = ""
+            try:
+                body = resp.json()
+                detail = body.get("detail", body.get("title", ""))
+            except Exception:
+                detail = resp.text[:200]
+            logger.warning("FlightAware %s → %d: %s", path, resp.status_code, detail)
+            return None, resp.status_code, detail
+    except Exception as e:
+        logger.warning("FlightAware request error: %s", e)
+        return None, 0, str(e)
+
+
+def _parse_fa_positions(track_data: dict) -> list[TrailPoint]:
+    """Parse FlightAware track positions into TrailPoint list."""
+    from datetime import datetime as _dt
+    positions: list[TrailPoint] = []
+    for pos in track_data.get("positions", []):
+        lat = pos.get("latitude")
+        lon = pos.get("longitude")
+        if lat is None or lon is None:
+            continue
+        alt_hundreds = pos.get("altitude")
+        alt_ft = alt_hundreds * 100 if isinstance(alt_hundreds, (int, float)) else None
+        ts_str = pos.get("timestamp", "")
+        try:
+            ts = _dt.fromisoformat(ts_str.replace("Z", "+00:00")).timestamp()
+        except Exception:
+            ts = 0.0
+        positions.append(TrailPoint(ts=ts, lat=lat, lon=lon, alt=alt_ft))
+    return positions
+
+
+def _safe_int(val) -> int | None:
+    if val is None:
+        return None
+    try:
+        return int(val)
+    except (ValueError, TypeError):
+        return None
+
+
+@router.get("/aircraft/flightaware/{ident}")
+async def get_flightaware_route(ident: str, registration: str | None = Query(None)):
+    """Fetch full flight route from FlightAware AeroAPI.
+    Tries callsign first, then registration as fallback. Handles blocked military aircraft."""
+    try:
+        return await _do_flightaware_route(ident, registration)
+    except Exception as e:
+        logger.exception("FlightAware endpoint crashed for %s: %s", ident, e)
+        return FlightAwareResponse(
+            ident=ident, positions=[], total=0,
+            message=f"Internal error — {type(e).__name__}: {e}",
+        )
+
+
+_fa_rate_limited_until: float = 0.0
+
+
+async def _do_flightaware_route(ident: str, registration: str | None) -> FlightAwareResponse:
+    global _fa_rate_limited_until
+    api_key = os.getenv("FLIGHTAWARE_API_KEY", "").strip()
+    if not api_key or api_key in ("your-flightaware-key", "placeholder"):
+        return FlightAwareResponse(
+            ident=ident, positions=[], total=0, available=False,
+            message="FlightAware API key not configured",
+        )
+
+    cache_key = f"fa_route:{ident.upper()}:{(registration or '').upper()}"
+    cached = _get_cached(cache_key, 600)
+    if cached is not None:
+        return cached
+
+    if time.time() < _fa_rate_limited_until:
+        wait = int(_fa_rate_limited_until - time.time())
+        return FlightAwareResponse(
+            ident=ident, positions=[], total=0,
+            message=f"FlightAware rate limit — try again in ~{wait}s",
+        )
+
+    # Try callsign first, then registration without hyphens (max 2 calls)
+    idents_to_try = [ident]
+    if registration:
+        clean_reg = registration.replace("-", "").strip()
+        if clean_reg.upper() != ident.upper():
+            idents_to_try.append(clean_reg)
+
+    flights_data = None
+    used_ident = ident
+    last_error = ""
+    for try_ident in idents_to_try:
+        data, status, err = await _fa_get(f"/flights/{try_ident}")
+        if status == 429:
+            _fa_rate_limited_until = time.time() + 60
+            return FlightAwareResponse(
+                ident=ident, positions=[], total=0,
+                message="FlightAware rate limit reached — wait ~60s before retrying",
+            )
+        if data and data.get("flights"):
+            flights_data = data
+            used_ident = try_ident
+            break
+        if status == 400 and "blocked" in err.lower():
+            result = FlightAwareResponse(
+                ident=ident, positions=[], total=0, blocked=True,
+                message=f"Aircraft '{try_ident}' is blocked on FlightAware (common for military)",
+            )
+            _set_cache(cache_key, result)
+            return result
+        if status == 200:
+            last_error = f"No active flights for '{try_ident}'"
+        elif status == 404:
+            last_error = f"'{try_ident}' not found"
+        else:
+            last_error = err or f"FlightAware error {status}"
+
+    if not flights_data or not flights_data.get("flights"):
+        tried = " / ".join(idents_to_try)
+        result = FlightAwareResponse(
+            ident=ident, positions=[], total=0,
+            message=last_error or f"No flights found ({tried}). Military flights are often not tracked.",
+        )
+        _set_cache(cache_key, result)
+        return result
+
+    flight = flights_data["flights"][0]
+    fa_id = flight.get("fa_flight_id")
+    origin = flight.get("origin") or {}
+    dest = flight.get("destination") or {}
+    origin_code = origin.get("code_iata") or origin.get("code_icao") or origin.get("code")
+    origin_name = origin.get("name")
+    dest_code = dest.get("code_iata") or dest.get("code_icao") or dest.get("code")
+    dest_name = dest.get("name")
+    origin_str = f"{origin_code} ({origin_name})" if origin_name and origin_code else origin_code
+    dest_str = f"{dest_code} ({dest_name})" if dest_name and dest_code else dest_code
+    flight_reg = registration or flight.get("registration")
+
+    # Extract owner from the flights response itself (no extra API call)
+    owner_str = None
+    raw_operator = flight.get("operator")
+    if isinstance(raw_operator, dict):
+        owner_str = raw_operator.get("name")
+    elif isinstance(raw_operator, str):
+        owner_str = raw_operator
+
+    common_kwargs = dict(
+        origin=origin_str, destination=dest_str,
+        aircraft_type=flight.get("aircraft_type"),
+        route_distance=f"{flight.get('route_distance')} nm" if flight.get("route_distance") else None,
+        operator=owner_str, operator_icao=flight.get("operator_icao"),
+        status=flight.get("status"), owner=None,
+        departure_time=flight.get("actual_out") or flight.get("scheduled_out"),
+        arrival_time=flight.get("actual_in"),
+        estimated_arrival=flight.get("estimated_in") or flight.get("scheduled_in"),
+        filed_ete=_safe_int(flight.get("filed_ete")),
+        progress_percent=_safe_int(flight.get("progress_percent")),
+        filed_altitude=_safe_int(flight.get("filed_altitude")),
+        filed_airspeed=_safe_int(flight.get("filed_airspeed")),
+        filed_route=flight.get("route"),
+        registration=flight_reg,
+    )
+
+    if not fa_id:
+        result = FlightAwareResponse(
+            ident=used_ident, positions=[], total=0, **common_kwargs,
+            message="Flight found but no track ID — may be scheduled or blocked",
+        )
+        _set_cache(cache_key, result)
+        return result
+
+    # Fetch track (2nd API call)
+    track_data, track_status, track_err = await _fa_get(f"/flights/{fa_id}/track")
+    if track_status == 429:
+        _fa_rate_limited_until = time.time() + 60
+        return FlightAwareResponse(
+            ident=ident, positions=[], total=0,
+            message="FlightAware rate limit reached — wait ~60s before retrying",
+        )
+    positions = _parse_fa_positions(track_data) if track_data else []
+
+    result = FlightAwareResponse(
+        ident=used_ident, positions=positions, total=len(positions),
+        fa_flight_id=fa_id, **common_kwargs,
+        message=track_err if not positions else None,
+    )
+    _set_cache(cache_key, result)
+    return result
+
+
 async def _fetch_opensky_track(icao24: str) -> list[TrailPoint]:
     """Fetch full flight track from OpenSky Network (path since last takeoff)."""
     cache_key = f"opensky_track:{icao24}"
@@ -510,18 +743,29 @@ async def _fetch_merged_military_aircraft() -> list[AircraftPosition]:
     return result
 
 
+_ADSB_SOURCES = [
+    ("adsb.lol", "https://api.adsb.lol/v2/mil"),
+    ("airplanes.live", "https://api.airplanes.live/v2/mil"),
+]
+
+
 async def _fetch_adsblol() -> list[AircraftPosition]:
-    """Fetch military aircraft from adsb.lol."""
-    try:
-        async with httpx.AsyncClient(timeout=15.0) as client:
-            resp = await client.get("https://api.adsb.lol/v2/mil")
-            resp.raise_for_status()
-            data = resp.json()
-        ac_list = data.get("ac", [])
-        return [_parse_aircraft(ac) for ac in ac_list if ac.get("lat") and ac.get("lon")]
-    except Exception as e:
-        logger.error("adsb.lol fetch failed: %s", e)
-        return []
+    """Fetch military aircraft from adsb.lol with airplanes.live as fallback."""
+    for name, url in _ADSB_SOURCES:
+        try:
+            async with httpx.AsyncClient(timeout=12.0) as client:
+                resp = await client.get(url)
+                resp.raise_for_status()
+                data = resp.json()
+            ac_list = data.get("ac", [])
+            result = [_parse_aircraft(ac) for ac in ac_list if ac.get("lat") and ac.get("lon")]
+            if result:
+                logger.info("%s: %d military aircraft", name, len(result))
+                return result
+        except Exception as e:
+            logger.warning("%s fetch failed: %s", name, e)
+    logger.error("All ADS-B sources failed")
+    return []
 
 
 # Genuine military ICAO24 hex ranges per country

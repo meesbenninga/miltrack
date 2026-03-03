@@ -17,3 +17,5 @@ env:
     valueFrom: brave_api_key
   - name: UCDP_ACCESS_TOKEN
     valueFrom: ucdp_access_token
+  - name: FLIGHTAWARE_API_KEY
+    valueFrom: flightaware_api_key

@@ -82,6 +82,33 @@ export interface TrailResponse {
   total: number;
 }
 
+export interface FlightAwareResponse {
+  ident: string;
+  positions: TrailPoint[];
+  total: number;
+  fa_flight_id: string | null;
+  origin: string | null;
+  destination: string | null;
+  aircraft_type: string | null;
+  route_distance: string | null;
+  owner: string | null;
+  operator: string | null;
+  operator_icao: string | null;
+  status: string | null;
+  blocked: boolean;
+  available: boolean;
+  message: string | null;
+  departure_time: string | null;
+  arrival_time: string | null;
+  estimated_arrival: string | null;
+  filed_ete: number | null;
+  progress_percent: number | null;
+  filed_altitude: number | null;
+  filed_airspeed: number | null;
+  filed_route: string | null;
+  registration: string | null;
+}
+
 export interface MilitaryBase {
   id: number;
   name: string | null;
@@ -177,6 +204,15 @@ export async function fetchTrail(hex: string): Promise<TrailResponse> {
   return res.json();
 }
 
+export async function fetchFlightAwareRoute(ident: string, registration?: string): Promise<FlightAwareResponse> {
+  const params = new URLSearchParams();
+  if (registration) params.set("registration", registration);
+  const qs = params.toString();
+  const res = await fetch(`/api/aircraft/flightaware/${encodeURIComponent(ident)}${qs ? `?${qs}` : ""}`);
+  if (!res.ok) throw new Error(`FlightAware fetch failed: ${res.status}`);
+  return res.json();
+}
+
 export async function fetchStrikes(params?: { days?: number }): Promise<StrikesResponse> {
   const sp = new URLSearchParams();
   if (params?.days != null) sp.set("days", String(params.days));
@@ -263,16 +299,20 @@ export interface DeathTollCountry {
   ucdp_high: number | null;
   gdelt_total: number | null;
   source: string;
+  conflict_context: string | null;
 }
+
+export type DeathTollPreset = "30d" | "90d" | "ytd" | "2024" | "all";
 
 export interface DeathTollResponse {
   by_country: DeathTollCountry[];
   ucdp_available: boolean;
   period: string;
+  preset: string;
 }
 
-export async function fetchDeathToll(): Promise<DeathTollResponse> {
-  const res = await fetch("/api/death-toll");
+export async function fetchDeathToll(preset: DeathTollPreset = "all"): Promise<DeathTollResponse> {
+  const res = await fetch(`/api/death-toll?preset=${preset}`);
   if (!res.ok) throw new Error(`Death toll fetch failed: ${res.status}`);
   return res.json();
 }

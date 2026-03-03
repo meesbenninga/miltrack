@@ -23,3 +23,8 @@ resources:
             scope: miltrack-secrets
             key: ucdp-access-token
             permission: READ
+        - name: flightaware_api_key
+          secret:
+            scope: miltrack-secrets
+            key: flightaware-api-key
+            permission: READ
