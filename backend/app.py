@@ -218,29 +218,33 @@ app = FastAPI(
 @app.get("/api/health")
 def health():
     """Debug: verify env vars are injected (no secrets exposed)."""
+    from backend.intel import _llm_configured
     static_exists = (Path(__file__).parent.parent / "frontend" / "dist").exists()
     return {
         "status": "ok",
         "brave_configured": bool(os.getenv("BRAVE_SEARCH_API_KEY")),
-        "llm_configured": bool(os.getenv("DATABRICKS_TOKEN")) and (bool(os.getenv("DATABRICKS_ENDPOINT_URL")) or bool(os.getenv("DATABRICKS_HOST"))),
+        "llm_configured": _llm_configured(),
         "frontend_dist_exists": static_exists,
     }
 
 
 @app.get("/api/debug/llm-test")
 async def debug_llm_test():
-    """Diagnostic: make a minimal LLM call and return status/error."""
+    """Diagnostic: make a minimal LLM call and return status/error. Uses SP or PAT."""
     import httpx
+    from backend.intel import _get_auth_headers, _llm_configured
+    if not _llm_configured():
+        return {"ok": False, "error": "LLM not configured (need DATABRICKS_HOST + SP or PAT)"}
     host = (os.getenv("DATABRICKS_HOST", "") or "").rstrip("/")
-    token = os.getenv("DATABRICKS_TOKEN", "")
-    if not host or not token:
-        return {"ok": False, "error": "DATABRICKS_HOST or DATABRICKS_TOKEN not set"}
+    auth_headers = _get_auth_headers()
+    if not auth_headers:
+        return {"ok": False, "error": "No auth (SP or DATABRICKS_TOKEN)"}
     url = f"{host}/serving-endpoints/databricks-claude-opus-4-6/invocations"
     try:
         async with httpx.AsyncClient(timeout=30.0) as client:
             r = await client.post(
                 url,
-                headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"},
+                headers={**auth_headers, "Content-Type": "application/json"},
                 json={
                     "messages": [{"role": "user", "content": "Reply with one word: OK"}],
                     "max_tokens": 10,

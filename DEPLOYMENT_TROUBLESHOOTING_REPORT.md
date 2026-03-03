@@ -140,8 +140,8 @@ The workspace has a per-minute token limit for Foundation Model APIs. The app ru
 |-----------|------------|
 | Config file | Single `app.yaml`; `app.yml` removed |
 | LLM endpoint | Workspace URL; `DATABRICKS_HOST` + `/serving-endpoints/{model}/invocations` |
-| Auth | PAT (`DATABRICKS_TOKEN`) preferred over service principal |
-| Brave API key | Hardcoded in `app.yaml`; `valueFrom` deprecated for this use |
+| Auth | Service principal (Apps); PAT (`DATABRICKS_TOKEN`) for local dev only |
+| Brave API key | Injected via `valueFrom: brave_api_key` from Secret Scope |
 | Frontend | Explicit `import-dir` of `frontend/dist` after sync |
 | Rate limits | 5-model fallback chain; automatic switch on 429 |
 
