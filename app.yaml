@@ -12,5 +12,8 @@ env:
   # 5-model fallback chain — on 429 rate limit, switch to next
   - name: DATABRICKS_LLM_MODEL
     value: "databricks-claude-sonnet-4-6,databricks-meta-llama-3-1-70b-instruct,databricks-gemini-2-5-flash,databricks-claude-sonnet-4-5,databricks-claude-opus-4-6"
-  # DATABRICKS_TOKEN and BRAVE_SEARCH_API_KEY: set via Databricks App Resources (Secret Scope)
-  # Never commit secrets. See .env.example and DEPLOY.md.
+  # Injected from App Resources. Auth uses app's service principal (no PAT needed).
+  - name: BRAVE_SEARCH_API_KEY
+    valueFrom: brave_api_key
+  - name: UCDP_ACCESS_TOKEN
+    valueFrom: ucdp_access_token

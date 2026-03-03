@@ -78,7 +78,8 @@ In the Databricks UI:
 3. **Description**: `Live military aircraft tracker & conflict monitor with AI intelligence`
 4. Click **Next: Configure**:
    - **Compute size**: **Medium** (2 vCPU, 6GB — sufficient since LLM runs on AI Gateway)
-   - **Resources**: Add secret → scope `miltrack-secrets`, key `brave-api-key`, resource key `brave_api_key`
+   - **Resources**: Configured automatically by `deploy.sh` via `databricks apps update` (no manual UI step)
+   - **Auth**: App uses its service principal (no PAT). Grant the SP "Can Query" on AI Gateway / Foundation Model endpoints.
 5. **Permissions**: Grant **Can Use** to the users/groups who should access the app
 6. Click **Create app**
 

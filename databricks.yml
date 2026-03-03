@@ -12,3 +12,14 @@ resources:
       name: miltrack
       description: "Live military aircraft tracker — ADS-B + ACLED conflict data"
       source_code_path: ./
+      resources:
+        - name: brave_api_key
+          secret:
+            scope: miltrack-secrets
+            key: brave-api-key
+            permission: READ
+        - name: ucdp_access_token
+          secret:
+            scope: miltrack-secrets
+            key: ucdp-access-token
+            permission: READ

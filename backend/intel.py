@@ -58,14 +58,9 @@ _init_databricks_auth()
 def _get_auth_headers() -> dict[str, str]:
     """Get Databricks Authorization headers.
 
-    Prefers an explicit DATABRICKS_TOKEN (PAT) because the app's service
-    principal currently cannot call Foundation Model API system endpoints
-    (permissions are being migrated to Unity Catalog).
-    Falls back to SDK unified auth (M2M OAuth) when no PAT is set.
+    In Databricks Apps: uses service principal (SDK auto-detects DATABRICKS_CLIENT_ID/SECRET).
+    Locally: uses DATABRICKS_TOKEN (PAT) from .env if set; else SDK auth.
     """
-    token = os.getenv("DATABRICKS_TOKEN", "")
-    if token:
-        return {"Authorization": f"Bearer {token}"}
     if _databricks_config:
         try:
             result = _databricks_config.authenticate()
@@ -74,7 +69,10 @@ def _get_auth_headers() -> dict[str, str]:
             if isinstance(result, dict) and result:
                 return result
         except Exception as e:
-            logger.warning("SDK auth failed: %s", e)
+            logger.debug("SDK auth failed, trying PAT: %s", e)
+    token = os.getenv("DATABRICKS_TOKEN", "")
+    if token:
+        return {"Authorization": f"Bearer {token}"}
     return {}
 
 router = APIRouter()
@@ -307,7 +305,7 @@ def _llm_configured() -> bool:
     True when SDK auth is initialized OR a PAT is set, and we have
     either an AI Gateway endpoint URL or a workspace host.
     """
-    has_auth = bool(_databricks_config) or bool(os.getenv("DATABRICKS_TOKEN"))
+    has_auth = bool(_databricks_config) or bool(os.getenv("DATABRICKS_TOKEN")) or bool(os.getenv("DATABRICKS_CLIENT_ID"))
     endpoint_url = os.getenv("DATABRICKS_ENDPOINT_URL", "")
     host = os.getenv("DATABRICKS_HOST", "") or (_databricks_host or "")
     return bool(has_auth and (endpoint_url or host))

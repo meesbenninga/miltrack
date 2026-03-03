@@ -64,9 +64,16 @@ if [ -f .env ]; then
     databricks secrets put-secret "${SECRET_SCOPE}" "brave-api-key" --string-value "${BRAVE_KEY}"
     echo "  OK: brave-api-key stored"
   fi
+  UCDP_TOKEN=$(grep "^UCDP_ACCESS_TOKEN=" .env | cut -d'=' -f2-)
+  if [ -n "${UCDP_TOKEN}" ] && [ "${UCDP_TOKEN}" != "your-ucdp-token" ]; then
+    echo "  Storing UCDP token in secret scope..."
+    databricks secrets put-secret "${SECRET_SCOPE}" "ucdp-access-token" --string-value "${UCDP_TOKEN}"
+    echo "  OK: ucdp-access-token stored"
+  fi
 else
   echo "  WARN: No .env file found. Set secrets manually:"
   echo "    databricks secrets put-secret ${SECRET_SCOPE} brave-api-key"
+  echo "    databricks secrets put-secret ${SECRET_SCOPE} ucdp-access-token"
 fi
 echo ""
 
@@ -96,16 +103,42 @@ echo ""
 echo "[4/5] Creating/updating app '${APP_NAME}'..."
 
 if databricks apps get "${APP_NAME}" &>/dev/null; then
-  echo "  App already exists, deploying new version..."
+  echo "  App already exists"
 else
   echo "  Creating new app..."
   databricks apps create "${APP_NAME}" \
     --description "Live military aircraft tracker & conflict monitor with AI intelligence"
-  echo "  IMPORTANT: Configure the app in the Databricks UI:"
-  echo "    1. Go to Apps > ${APP_NAME} > Settings"
-  echo "    2. Compute size: Medium (2 vCPU, 6GB RAM)"
-  echo "    3. Add resource: Secret scope '${SECRET_SCOPE}', key 'brave-api-key', resource key 'brave_api_key'"
-  echo "    4. Permissions: Grant 'Can Use' to desired users/groups"
+fi
+
+# Configure app resources (secrets) programmatically — no manual UI needed
+echo "  Configuring app resources (brave_api_key, ucdp_access_token)..."
+RESOURCES_JSON=$(cat <<EOF
+{
+  "resources": [
+    {
+      "name": "brave_api_key",
+      "secret": {
+        "scope": "${SECRET_SCOPE}",
+        "key": "brave-api-key",
+        "permission": "READ"
+      }
+    },
+    {
+      "name": "ucdp_access_token",
+      "secret": {
+        "scope": "${SECRET_SCOPE}",
+        "key": "ucdp-access-token",
+        "permission": "READ"
+      }
+    }
+  ]
+}
+EOF
+)
+if databricks apps update "${APP_NAME}" --json "${RESOURCES_JSON}" 2>/dev/null; then
+  echo "  OK: App resources configured"
+else
+  echo "  WARN: Could not update app resources via CLI. If secrets fail, add them manually in Apps > ${APP_NAME} > Settings > Resources"
 fi
 echo ""
 
