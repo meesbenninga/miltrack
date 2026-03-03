@@ -64,10 +64,16 @@ Store sensitive API keys securely — never in code or `app.yaml`.
 # Create a scope for MilTrack secrets
 databricks secrets create-scope miltrack-secrets
 
-# Store the Brave Search API key
-echo -n "BSAItDrXVWrs8SjHT4X3Y2nwsjMgPB3" | \
+# Store the Brave Search API key (use your own key from .env — never commit real keys)
+echo -n "YOUR_BRAVE_API_KEY" | \
   databricks secrets put-secret miltrack-secrets brave-api-key --binary-file /dev/stdin
+
+# Store the UCDP token (optional, for verified death tolls)
+echo -n "YOUR_UCDP_TOKEN" | \
+  databricks secrets put-secret miltrack-secrets ucdp-access-token --binary-file /dev/stdin
 ```
+
+**Note:** `./deploy.sh` reads keys from `.env` and stores them automatically — you typically don't need to run these commands manually.
 
 ### 2. Create the App
 
