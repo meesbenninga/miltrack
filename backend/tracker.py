@@ -4,17 +4,26 @@ Data sources:
 - adsb.lol /v2/mil — free, unfiltered military ADS-B data
 - OpenSky Network — free ADS-B data (supplements adsb.lol)
 - GDELT Project — free, real-time conflict event data (no auth needed)
+- ACLED — curated conflict event data (free registration required)
 - OpenStreetMap / Overpass — military airbase locations (static layer)
+- GDELT DOC 2.0 — real-time global news articles (no auth needed)
+- X (Twitter) API v2 — tweets (paid, requires X_API_BEARER_TOKEN)
 """
 
 from __future__ import annotations
 
 import asyncio
+import csv
 import datetime
+import io
 import json
 import logging
 import os
+import re
 import time
+import xml.etree.ElementTree as ET
+import zipfile
+from email.utils import parsedate_to_datetime
 from typing import Optional
 
 import httpx
@@ -91,12 +100,21 @@ class StrikeEvent(BaseModel):
     fatalities: int | None = None
     notes: str | None = None
     source: str | None = None
+    # LLM-enriched fields
+    title: str | None = None
+    summary: str | None = None
+    severity: int | None = None       # 1-10
+    confidence: float | None = None   # 0.0-1.0 (is this a real military event?)
+    attack_direction: str | None = None  # "to_iran" | "from_iran" | "internal" | "other"
+    hours_ago: float | None = None    # computed at serve time
+    source_url: str | None = None     # link to original news article
 
 
 class StrikesResponse(BaseModel):
     events: list[StrikeEvent]
     total: int
     cached: bool = False
+    enriched: bool = False
     hint: str | None = None
 
 
@@ -112,6 +130,56 @@ def _in_bounds(lat: float | None, lon: float | None, lat_min: float, lat_max: fl
     if lat is None or lon is None:
         return False
     return lat_min <= lat <= lat_max and lon_min <= lon <= lon_max
+
+
+# Registration prefix → ISO 3166-1 alpha-2 (ICAO Annex 7 nationality marks)
+# Check 2-char first, then 1-char. Prefer registration over hex when both available (registration is on the aircraft; hex can miscode).
+_REG_PREFIX_TO_COUNTRY: dict[str, str] = {
+    # 2-char prefixes (check before 1-char)
+    "4X": "IL", "OE": "AT", "OM": "SK", "EP": "IR", "HA": "HU", "EI": "IE", "LX": "LU",
+    "HB": "CH", "OO": "BE", "PH": "NL", "LN": "NO", "OH": "FI", "SE": "SE", "OY": "DK", "TC": "TR",
+    "SP": "PL", "CS": "PT", "YR": "RO", "RA": "RU", "HZ": "SA", "A6": "AE", "A7": "QA",
+    "A9": "BH", "9K": "KW", "4L": "GE", "EX": "KG", "YL": "LV", "ER": "MD", "EW": "BY",
+    "UR": "UA", "UK": "UA", "9A": "HR", "S5": "SI", "LZ": "SK", "OK": "CZ", "9H": "MT",
+    "9M": "MY", "PK": "ID", "AP": "PK", "VH": "AU", "ZK": "NZ", "JA": "JP", "HL": "KR",
+    "VT": "IN", "AP": "PK", "HS": "TH", "VN": "VN", "RP": "PH", "PP": "BR", "PR": "BR",
+    "CC": "CL", "HK": "CO", "XA": "MX", "XB": "MX", "XC": "MX", "TI": "CR", "HP": "PA",
+    "TG": "GT", "HR": "HN", "YN": "NI", "CP": "BO", "OB": "PE", "CC": "CL", "CX": "UY",
+    "ZP": "PY", "PT": "BR", "PS": "BR", "SU": "EG", "7O": "YE", "5A": "LY", "5R": "MG",
+    "3B": "MU", "3D": "SZ", "ZS": "ZA", "ZR": "ZW", "5Y": "KE", "5X": "UG", "ET": "ET",
+    "ST": "SD", "7T": "DZ", "CN": "MA", "TS": "TN", "3V": "BJ", "5V": "TG", "5U": "NE",
+    "TT": "BF", "TU": "CI", "TR": "GA", "TL": "CF", "TY": "BJ", "3X": "GN", "9L": "SL",
+    "EL": "LR", "5N": "NG", "9G": "GH", "9U": "BI", "9R": "RW", "5H": "TZ", "5Y": "KE",
+}
+# 1-char prefixes (used when 2-char not found)
+_REG_PREFIX_1CHAR: dict[str, str] = {
+    "N": "US", "G": "GB", "F": "FR", "D": "DE", "I": "IT", "E": "ES", "P": "PL",
+    "C": "CA", "B": "CN",
+}
+
+
+def _registration_to_country(reg: str | None) -> str | None:
+    """Derive country from registration prefix (ICAO Annex 7). Returns ISO 3166-1 alpha-2 or None."""
+    if not reg or not isinstance(reg, str):
+        return None
+    s = reg.strip().upper()
+    if not s:
+        return None
+    # Extract prefix: before hyphen if present, else first 2 then 1 chars
+    if "-" in s:
+        prefix = s.split("-")[0].strip()
+    else:
+        prefix = s[:2] if len(s) >= 2 else s[:1]
+    if not prefix:
+        return None
+    # Try 2-char first (for prefixes like 4X, OM)
+    if len(prefix) >= 2:
+        two = prefix[:2]
+        if two in _REG_PREFIX_TO_COUNTRY:
+            return _REG_PREFIX_TO_COUNTRY[two]
+    # Try 1-char
+    one = prefix[0]
+    return _REG_PREFIX_1CHAR.get(one)
 
 
 # ICAO hex range → ISO 3166-1 alpha-2 country code
@@ -222,15 +290,24 @@ def _icao_hex_to_country(hex_code: str | None) -> str | None:
     return None
 
 
+def _resolve_country(registration: str | None, hex_code: str | None) -> str | None:
+    """Resolve country: prefer registration (on aircraft) over hex (can miscode)."""
+    reg_cc = _registration_to_country(registration)
+    if reg_cc:
+        return reg_cc
+    return _icao_hex_to_country(hex_code)
+
+
 def _parse_aircraft(ac: dict) -> AircraftPosition:
     hex_code = ac.get("hex")
+    registration = ac.get("r")
     return AircraftPosition(
         hex=hex_code,
         flight=(ac.get("flight") or "").strip() or None,
-        registration=ac.get("r"),
+        registration=registration,
         aircraft_type=ac.get("t"),
         description=ac.get("desc"),
-        country_code=_icao_hex_to_country(hex_code),
+        country_code=_resolve_country(registration, hex_code),
         lat=ac.get("lat"),
         lon=ac.get("lon"),
         alt_baro=ac.get("alt_baro"),
@@ -449,6 +526,7 @@ async def _fetch_adsblol() -> list[AircraftPosition]:
 
 # Genuine military ICAO24 hex ranges per country
 # Source: https://www.ads-b.nl/overview.php (ICAO allocation table)
+# National blocks from ICAO Annex 10 (military shares with civil when no dedicated block)
 _MIL_HEX_RANGES: list[tuple[int, int]] = [
     (0xADF7C0, 0xAFFFFF),  # USA military
     (0x3F0000, 0x3FFFFF),  # Germany military
@@ -463,9 +541,40 @@ _MIL_HEX_RANGES: list[tuple[int, int]] = [
     (0x800000, 0x83FFFF),  # India military
     (0x200000, 0x20FFFF),  # Japan military (JASDF)
     (0x500000, 0x507FFF),  # Israel (all aviation, small country)
-    (0x894000, 0x894FFF),  # Pakistan military
-    (0x700000, 0x700FFF),  # Saudi Arabia (partial mil)
-    (0x738000, 0x738FFF),  # Turkey military
+    (0x894000, 0x897FFF),  # Pakistan military
+    (0x700000, 0x70FFFF),  # Saudi Arabia
+    (0x738000, 0x73FFFF),  # Turkey military
+    # Nordics
+    (0x458000, 0x45BFFF),  # Denmark
+    (0x460000, 0x463FFF),  # Finland
+    (0x480000, 0x487FFF),  # Norway
+    (0x4A8000, 0x4AFFFF),  # Sweden
+    # Gulf states
+    (0x880000, 0x887FFF),  # UAE
+    (0x888000, 0x88FFFF),  # Bahrain
+    (0x890000, 0x893FFF),  # Qatar
+    (0x748000, 0x74FFFF),  # Kuwait
+    (0x898000, 0x8FFFFF),  # Oman
+    # NATO allies
+    (0x448000, 0x44FFFF),  # Belgium
+    (0x488000, 0x48FFFF),  # Poland
+    (0x490000, 0x497FFF),  # Portugal
+    (0x470000, 0x477FFF),  # Greece
+    (0x498000, 0x49FFFF),  # Czech Republic
+    (0x4A0000, 0x4A7FFF),  # Romania
+    (0x450000, 0x457FFF),  # Bulgaria
+    # Conflict actors (often transponder-off, but when broadcasting we show them)
+    (0x100000, 0x1FFFFF),  # Russia
+    (0x720000, 0x727FFF),  # Iran
+    (0x728000, 0x72FFFF),  # Iraq
+    (0x518000, 0x51FFFF),  # Syria
+    (0x510000, 0x517FFF),  # Lebanon
+    (0x508000, 0x50FFFF),  # Jordan
+    (0x740000, 0x747FFF),  # Jordan (main civil block)
+    (0x010000, 0x017FFF),  # Egypt
+    (0x018000, 0x01FFFF),  # Libya
+    (0x680000, 0x6FFFFF),  # China
+    (0x600000, 0x6003FF),  # Afghanistan
 ]
 
 
@@ -620,11 +729,7 @@ def _ms_to_knots(ms: float | None) -> float | None:
     return round(ms * 1.94384, 1)
 
 
-# --- Strike / conflict event endpoints (GDELT Event Files) ---
-
-import csv
-import io
-import zipfile
+# --- Strike / conflict event endpoints (GDELT → LLM enrichment) ---
 
 # CAMEO root codes for violent events
 _CAMEO_VIOLENT = {"18", "19", "20"}  # 18=Assault, 19=Fight, 20=Use unconventional violence/force
@@ -635,12 +740,12 @@ _ME_FIPS = {"IR", "IZ", "SY", "IS", "LE", "YM", "GZ", "WE", "JO", "TU", "SA", "E
 # GDELT v2 export TSV column indices (61 columns total)
 _COL_GLOBALEVENTID = 0
 _COL_DAY = 1
-_COL_ACTOR1NAME = 6      # Actor1Name (5=Actor1Code)
-_COL_ACTOR1COUNTRY = 7   # Actor1CountryCode
-_COL_ACTOR2NAME = 16     # Actor2Name (15=Actor2Code)
-_COL_ACTOR2COUNTRY = 17  # Actor2CountryCode
-_COL_EVENTROOTCODE = 28  # EventRootCode (26=EventCode, 27=EventBaseCode)
-_COL_EVENTCODE = 26      # EventCode
+_COL_ACTOR1NAME = 6
+_COL_ACTOR1COUNTRY = 7
+_COL_ACTOR2NAME = 16
+_COL_ACTOR2COUNTRY = 17
+_COL_EVENTROOTCODE = 28
+_COL_EVENTCODE = 26
 _COL_GOLDSTEIN = 30
 _COL_NUMMENTIONS = 31
 _COL_NUMSOURCES = 32
@@ -653,28 +758,69 @@ _COL_ACTIONGEO_FULLNAME = 52
 _COL_ACTIONGEO_COUNTRYCODE = 53
 _COL_ACTIONGEO_LAT = 56
 _COL_ACTIONGEO_LONG = 57
+_COL_DATEADDED = 59
 _COL_SOURCEURL = 60
 
 
 @router.get("/strikes", response_model=StrikesResponse)
 async def get_strike_events(
-    days: int = Query(7, ge=1, le=90),
-    limit: int = Query(500, ge=1, le=2000),
+    days: int = Query(7, ge=1, le=180),
+    limit: int = Query(500, ge=1, le=5000),
 ):
-    """Fetch conflict events from GDELT Event files (free, no auth required)."""
-    cache_key = f"gdelt_events:{days}"
+    """Fetch conflict events from GDELT, optionally enriched by LLM."""
+    cache_key = f"strikes:{days}"
     cached = _get_cached(cache_key, CACHE_TTL_STRIKES)
     if cached is not None:
-        return StrikesResponse(events=cached, total=len(cached), cached=True)
+        events = _compute_hours_ago(cached)
+        is_enriched = any(e.title is not None for e in events)
+        return StrikesResponse(events=events, total=len(events), cached=True, enriched=is_enriched)
 
-    events = await _fetch_gdelt_event_files(days, limit)
-    _set_cache(cache_key, events)
-    return StrikesResponse(events=events, total=len(events), cached=False)
+    gdelt_events = await _fetch_gdelt_event_files(days, limit)
+
+    all_events = gdelt_events[:limit]
+    all_events.sort(key=lambda e: e.event_date or "", reverse=True)
+    all_events = _compute_hours_ago(all_events)
+
+    _set_cache(cache_key, all_events)
+    return StrikesResponse(
+        events=all_events, total=len(all_events), cached=False, enriched=False,
+        hint="Conflict events are being processed by AI. Enriched data will appear shortly.",
+    )
+
+
+def _compute_hours_ago(events: list[StrikeEvent]) -> list[StrikeEvent]:
+    """Compute hours_ago for each event based on event_date."""
+    now = datetime.datetime.now(datetime.timezone.utc)
+    for ev in events:
+        if ev.event_date:
+            try:
+                if "T" in ev.event_date:
+                    dt = datetime.datetime.strptime(ev.event_date, "%Y-%m-%dT%H:%M:%S")
+                else:
+                    dt = datetime.datetime.strptime(ev.event_date, "%Y-%m-%d")
+                dt = dt.replace(tzinfo=datetime.timezone.utc)
+                delta = now - dt
+                ev.hours_ago = round(delta.total_seconds() / 3600, 1)
+            except ValueError:
+                pass
+    return events
+
+
+def _haversine_km(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
+    """Fast haversine distance in km."""
+    from math import radians, sin, cos, sqrt, atan2
+    R = 6371
+    dlat = radians(lat2 - lat1)
+    dlon = radians(lon2 - lon1)
+    a = sin(dlat / 2) ** 2 + cos(radians(lat1)) * cos(radians(lat2)) * sin(dlon / 2) ** 2
+    return R * 2 * atan2(sqrt(a), sqrt(1 - a))
+
+
+# --- GDELT event files ---
 
 
 async def _fetch_gdelt_event_files(days: int, limit: int) -> list[StrikeEvent]:
     """Download recent GDELT v2 event export files and filter for ME military events."""
-    # Get list of recent update files
     try:
         async with httpx.AsyncClient(timeout=15.0, follow_redirects=True) as client:
             resp = await client.get("http://data.gdeltproject.org/gdeltv2/lastupdate.txt")
@@ -684,7 +830,6 @@ async def _fetch_gdelt_event_files(days: int, limit: int) -> list[StrikeEvent]:
         logger.error("Failed to get GDELT file list: %s", e)
         return []
 
-    # Extract the export CSV URL (first line)
     export_urls: list[str] = []
     for line in lines:
         parts = line.strip().split()
@@ -695,15 +840,16 @@ async def _fetch_gdelt_event_files(days: int, limit: int) -> list[StrikeEvent]:
         logger.warning("No GDELT export URLs found")
         return []
 
-    # For more history, also fetch the master file list for the past N days
     if days > 1:
         extra_urls = await _get_gdelt_historical_urls(days)
         export_urls = extra_urls + export_urls
 
+    # Fetch more files per day for better coverage (was 4, now 8)
+    max_files = min(len(export_urls), days * 8)
     events: list[StrikeEvent] = []
     seen_ids: set[str] = set()
 
-    for url in export_urls[:min(len(export_urls), days * 4)]:  # ~4 files per day is enough
+    for url in export_urls[:max_files]:
         try:
             batch = await _download_parse_gdelt_export(url, seen_ids)
             events.extend(batch)
@@ -713,20 +859,19 @@ async def _fetch_gdelt_event_files(days: int, limit: int) -> list[StrikeEvent]:
             logger.error("Failed to process GDELT file %s: %s", url, e)
 
     events = events[:limit]
-    logger.info("Fetched %d GDELT conflict events from %d files", len(events), len(export_urls))
+    logger.info("Fetched %d GDELT conflict events from %d files", len(events), max_files)
     return events
 
 
 async def _get_gdelt_historical_urls(days: int) -> list[str]:
-    """Get GDELT export file URLs for past N days via masterfilelist-translation."""
+    """Get GDELT export file URLs for past N days."""
     urls: list[str] = []
     now = datetime.datetime.now(datetime.timezone.utc)
 
-    # Sample a few timestamps per day (every 6 hours) to get representative files
-    for d in range(1, min(days + 1, 15)):
-        for h in [0, 6, 12, 18]:
-            ts = now - datetime.timedelta(days=d, hours=-h)
-            # Round to 15-minute GDELT interval
+    # Sample every 3 hours for better coverage (was every 6)
+    for d in range(1, min(days + 1, 30)):
+        for h in range(0, 24, 3):
+            ts = now - datetime.timedelta(days=d) + datetime.timedelta(hours=h)
             minute = (ts.minute // 15) * 15
             stamp = ts.strftime(f"%Y%m%d%H{minute:02d}00")
             url = f"http://data.gdeltproject.org/gdeltv2/{stamp}.export.CSV.zip"
@@ -776,7 +921,14 @@ async def _download_parse_gdelt_export(url: str, seen_ids: set[str]) -> list[Str
                     seen_ids.add(event_id)
 
                     day_str = row[_COL_DAY]
-                    event_date = f"{day_str[:4]}-{day_str[4:6]}-{day_str[6:8]}" if len(day_str) >= 8 else None
+                    # Use DATEADDED (YYYYMMDDHHmmSS) for precise timestamps
+                    date_added = row[_COL_DATEADDED] if len(row) > _COL_DATEADDED else ""
+                    if len(date_added) >= 14:
+                        event_date = f"{date_added[:4]}-{date_added[4:6]}-{date_added[6:8]}T{date_added[8:10]}:{date_added[10:12]}:{date_added[12:14]}"
+                    elif len(day_str) >= 8:
+                        event_date = f"{day_str[:4]}-{day_str[4:6]}-{day_str[6:8]}"
+                    else:
+                        event_date = None
 
                     event_code = row[_COL_EVENTCODE]
                     event_type = {
@@ -797,7 +949,7 @@ async def _download_parse_gdelt_export(url: str, seen_ids: set[str]) -> list[Str
                     mentions = _safe_int(row[_COL_NUMMENTIONS])
 
                     events.append(StrikeEvent(
-                        event_id=event_id,
+                        event_id=f"gdelt-{event_id}",
                         event_date=event_date,
                         event_type=event_type,
                         sub_event_type=None,
@@ -811,7 +963,8 @@ async def _download_parse_gdelt_export(url: str, seen_ids: set[str]) -> list[Str
                         longitude=lon,
                         fatalities=None,
                         notes=f"Goldstein: {goldstein}, Mentions: {mentions}" if goldstein else None,
-                        source=source_url,
+                        source=f"GDELT · {source_url}" if source_url else "GDELT",
+                        source_url=source_url,
                     ))
 
                 return events
@@ -934,7 +1087,7 @@ out center;
         return []
 
 
-# --- Military news feed (RSS) ---
+# --- Military news feed (RSS + GDELT DOC 2.0) ---
 
 
 class NewsItem(BaseModel):
@@ -943,137 +1096,509 @@ class NewsItem(BaseModel):
     published: str | None = None
     source: str | None = None
     summary: str | None = None
+    relevance: float = 0.0
 
 
 class NewsResponse(BaseModel):
     items: list[NewsItem]
     total: int
     cached: bool = False
+    sources_ok: int = 0
+    sources_failed: int = 0
 
 
-CACHE_TTL_NEWS = 900  # 15 minutes
+CACHE_TTL_NEWS = 300  # 5 minutes
 
 _RSS_FEEDS: list[tuple[str, str]] = [
-    ("https://www.jpost.com/rss/rssfeedsmilitaryanddefense", "Jerusalem Post"),
-    ("https://www.timesofisrael.com/feed/", "Times of Israel"),
+    # Military / defense specialist
+    ("https://www.thedrive.com/the-war-zone/feed", "The War Zone"),
+    ("https://breakingdefense.com/feed/", "Breaking Defense"),
     ("https://feeds.feedburner.com/defense-news/home", "Defense News"),
+    ("https://theaviationist.com/feed/", "The Aviationist"),
+    # Middle East focused
+    ("https://www.israelhayom.com/feed/", "Israel Hayom"),
+    ("https://www.timesofisrael.com/feed/", "Times of Israel"),
     ("https://www.aljazeera.com/xml/rss/all.xml", "Al Jazeera"),
     ("https://rss.nytimes.com/services/xml/rss/nyt/MiddleEast.xml", "NY Times ME"),
     ("https://feeds.bbci.co.uk/news/world/middle_east/rss.xml", "BBC Middle East"),
+    ("https://www.middleeasteye.net/rss", "Middle East Eye"),
+    # US & UK news
+    ("https://moxie.foxnews.com/google-publisher/world.xml", "Fox News"),
+    ("https://rss.cnn.com/rss/cnn_world.rss", "CNN"),
+    ("https://www.theguardian.com/world/rss", "The Guardian"),
+    ("https://www.thetimes.co.uk/tto/news/rss/", "The Times"),
 ]
 
-_IRAN_KEYWORDS = {
-    "iran", "tehran", "isfahan", "irgc", "quds", "khamenei",
-    "israel", "idf", "netanyahu", "tel aviv", "gaza", "hezbollah",
-    "strike", "airstrike", "bombing", "missile", "military",
-    "conflict", "war", "attack", "defense", "air force",
-    "fighter", "jet", "drone", "uav", "tanker", "refueling",
-    "carrier", "deployment", "operation", "centcom",
-    "f-35", "f-15", "b-2", "b-52", "kc-135", "kc-46",
-    "strait of hormuz", "persian gulf", "red sea", "houthi", "yemen",
+# Tiered keyword scoring — high-value terms score more
+_KW_HIGH: set[str] = {
+    "iran", "tehran", "isfahan", "natanz", "irgc", "quds force", "khamenei",
+    "israel", "idf", "netanyahu", "gaza", "hezbollah", "hamas",
+    "airstrike", "missile strike", "air campaign", "military strike",
+    "centcom", "eucom", "strait of hormuz", "persian gulf", "red sea",
+    "f-35", "f-15", "b-2", "b-52", "kc-135", "kc-46", "rc-135",
+    "carrier strike group", "no-fly zone", "air defense",
+    "houthi", "ansar allah", "proxy war",
+}
+
+_KW_MED: set[str] = {
+    "military", "air force", "navy", "defense", "defence",
+    "fighter jet", "drone", "uav", "tanker", "refueling",
+    "deployment", "conflict", "war", "attack", "bombing",
+    "missile", "strike", "pentagon", "nato", "coalition",
+    "reconnaissance", "surveillance", "sortie",
+    "syria", "iraq", "yemen", "lebanon", "saudi",
+    "sanctions", "nuclear", "ballistic",
+}
+
+_KW_LOW: set[str] = {
+    "middle east", "security", "tension", "escalation", "ceasefire",
+    "weapons", "arms", "airspace", "interception",
+    "egypt", "turkey", "qatar", "bahrain", "uae", "kuwait",
+    "operation", "patrol", "base",
 }
 
 
-@router.get("/news", response_model=NewsResponse)
-async def get_military_news(limit: int = Query(50, ge=1, le=200)):
-    """Fetch latest military/Iran conflict news from RSS feeds."""
-    cache_key = "mil_news"
-    cached = _get_cached(cache_key, CACHE_TTL_NEWS)
-    if cached is not None:
-        return NewsResponse(items=cached[:limit], total=len(cached), cached=True)
+def _score_relevance(title: str, summary: str) -> float:
+    """Score article relevance 0.0–1.0 based on tiered keyword matches."""
+    text = (title + " " + summary).lower()
+    high_hits = sum(1 for kw in _KW_HIGH if kw in text)
+    med_hits = sum(1 for kw in _KW_MED if kw in text)
+    low_hits = sum(1 for kw in _KW_LOW if kw in text)
+    score = min(1.0, high_hits * 0.3 + med_hits * 0.12 + low_hits * 0.05)
+    title_low = title.lower()
+    if any(kw in title_low for kw in _KW_HIGH):
+        score = min(1.0, score + 0.2)
+    return round(score, 2)
 
-    items = await _fetch_rss_news()
-    _set_cache(cache_key, items)
-    return NewsResponse(items=items[:limit], total=len(items), cached=False)
+
+def _normalize_date(date_str: str | None) -> str | None:
+    """Normalize various date formats to ISO 8601."""
+    if not date_str:
+        return None
+    try:
+        dt = parsedate_to_datetime(date_str)
+        return dt.strftime("%Y-%m-%dT%H:%M:%SZ")
+    except Exception:
+        pass
+    for fmt in ("%Y-%m-%dT%H:%M:%S%z", "%Y-%m-%dT%H:%M:%SZ", "%Y-%m-%d %H:%M:%S"):
+        try:
+            dt = datetime.datetime.strptime(date_str.strip(), fmt)
+            return dt.strftime("%Y-%m-%dT%H:%M:%SZ")
+        except ValueError:
+            continue
+    return date_str
 
 
-async def _fetch_rss_news() -> list[NewsItem]:
-    """Fetch and parse RSS feeds, filter for Iran/military conflict relevance."""
-    import re
-    import xml.etree.ElementTree as ET
+def _dedup_news(items: list[NewsItem]) -> list[NewsItem]:
+    """Remove near-duplicate articles by normalized title prefix."""
+    seen: dict[str, NewsItem] = {}
+    for item in items:
+        key = re.sub(r"[^a-z0-9\s]", "", item.title.lower())
+        key = re.sub(r"\s+", " ", key).strip()[:60]
+        if key in seen:
+            if item.relevance > seen[key].relevance:
+                seen[key] = item
+        else:
+            seen[key] = item
+    return list(seen.values())
 
+
+async def _fetch_single_rss(
+    client: httpx.AsyncClient, feed_url: str, source_name: str,
+) -> tuple[list[NewsItem], bool]:
+    """Fetch and parse a single RSS feed. Returns (items, success)."""
+    try:
+        resp = await client.get(
+            feed_url,
+            headers={"User-Agent": "MilTrack/1.0 (military-aviation-tracker)"},
+        )
+        if resp.status_code != 200:
+            logger.warning("RSS %s returned %d", source_name, resp.status_code)
+            return [], False
+
+        root = ET.fromstring(resp.content)
+
+        items_el = root.findall(".//item")
+        if not items_el:
+            atom_ns = "{http://www.w3.org/2005/Atom}"
+            items_el = root.findall(f".//{atom_ns}entry")
+
+        results: list[NewsItem] = []
+        for el in items_el:
+            title = ""
+            for tag in ["title", "{http://www.w3.org/2005/Atom}title"]:
+                t = el.find(tag)
+                if t is not None:
+                    title = "".join(t.itertext()).strip()
+                    if title:
+                        break
+            if not title:
+                continue
+
+            link = ""
+            link_el = el.find("link")
+            if link_el is not None:
+                link = (link_el.text or "").strip() or link_el.get("href", "")
+            if not link:
+                atom_link = el.find("{http://www.w3.org/2005/Atom}link")
+                if atom_link is not None:
+                    link = atom_link.get("href", "")
+
+            published = None
+            for tag in [
+                "pubDate",
+                "{http://www.w3.org/2005/Atom}published",
+                "{http://www.w3.org/2005/Atom}updated",
+            ]:
+                t = el.find(tag)
+                if t is not None and t.text:
+                    published = _normalize_date(t.text.strip())
+                    break
+
+            summary = ""
+            for tag in [
+                "description",
+                "{http://www.w3.org/2005/Atom}summary",
+                "{http://www.w3.org/2005/Atom}content",
+            ]:
+                t = el.find(tag)
+                if t is not None:
+                    raw = "".join(t.itertext()).strip()
+                    if raw:
+                        summary = re.sub(r"<[^>]+>", "", raw)[:500]
+                        break
+
+            rel = _score_relevance(title, summary)
+            if rel < 0.05:
+                continue
+
+            results.append(NewsItem(
+                title=title,
+                link=link or None,
+                published=published,
+                source=source_name,
+                summary=summary[:250] if summary else None,
+                relevance=rel,
+            ))
+
+        logger.info("RSS %s: %d items, %d relevant", source_name, len(items_el), len(results))
+        return results, True
+    except Exception as e:
+        logger.error("RSS feed %s failed: %s", source_name, e)
+        return [], False
+
+
+_GDELT_NEWS_QUERIES = [
+    "military iran israel airstrike",
+    "missile strike conflict middle east",
+    "houthi drone red sea navy",
+]
+
+
+async def _fetch_gdelt_news() -> list[NewsItem]:
+    """Fetch recent military/conflict news from GDELT DOC 2.0 API (free, no auth)."""
     all_items: list[NewsItem] = []
+    seen_urls: set[str] = set()
 
-    async with httpx.AsyncClient(timeout=15.0, follow_redirects=True) as client:
-        for feed_url, source_name in _RSS_FEEDS:
+    async with httpx.AsyncClient(timeout=20.0, follow_redirects=True) as client:
+        for q in _GDELT_NEWS_QUERIES:
             try:
-                resp = await client.get(feed_url, headers={"User-Agent": "MilTrack/1.0"})
+                resp = await client.get(
+                    "http://api.gdeltproject.org/api/v2/doc/doc",
+                    params={
+                        "query": q,
+                        "mode": "artlist",
+                        "maxrecords": "75",
+                        "format": "json",
+                        "timespan": "48h",
+                        "sourcelang": "english",
+                    },
+                )
                 if resp.status_code != 200:
+                    logger.warning("GDELT DOC returned %d for '%s'", resp.status_code, q)
                     continue
 
-                # Parse XML from bytes to handle encoding properly
-                root = ET.fromstring(resp.content)
+                data = resp.json()
+                articles = data.get("articles", [])
 
-                # Handle both RSS 2.0 (<item>) and Atom (<entry>) formats
-                items = root.findall(".//item")
-                if not items:
-                    atom_ns = "{http://www.w3.org/2005/Atom}"
-                    items = root.findall(f".//{atom_ns}entry")
-
-                feed_count = 0
-                for item in items:
-                    # Extract title — try multiple approaches for CDATA handling
-                    title = ""
-                    for tag in ["title", "{http://www.w3.org/2005/Atom}title"]:
-                        el = item.find(tag)
-                        if el is not None:
-                            title = "".join(el.itertext()).strip()
-                            if title:
-                                break
-
-                    if not title:
+                for art in articles:
+                    title = (art.get("title") or "").strip()
+                    url = art.get("url", "")
+                    if not title or url in seen_urls:
                         continue
+                    seen_urls.add(url)
 
-                    # Extract link
-                    link = ""
-                    link_el = item.find("link")
-                    if link_el is not None:
-                        link = (link_el.text or "").strip() or link_el.get("href", "")
-                    if not link:
-                        atom_link = item.find("{http://www.w3.org/2005/Atom}link")
-                        if atom_link is not None:
-                            link = atom_link.get("href", "")
-
-                    # Extract published date
+                    seen_date = art.get("seendate", "")
                     published = None
-                    for tag in ["pubDate", "{http://www.w3.org/2005/Atom}published", "{http://www.w3.org/2005/Atom}updated"]:
-                        el = item.find(tag)
-                        if el is not None and el.text:
-                            published = el.text.strip()
-                            break
+                    if seen_date and len(seen_date) >= 14:
+                        try:
+                            published = (
+                                f"{seen_date[:4]}-{seen_date[4:6]}-{seen_date[6:8]}"
+                                f"T{seen_date[9:11]}:{seen_date[11:13]}:00Z"
+                            )
+                        except (IndexError, ValueError):
+                            pass
 
-                    # Extract summary/description
-                    summary = ""
-                    for tag in ["description", "{http://www.w3.org/2005/Atom}summary"]:
-                        el = item.find(tag)
-                        if el is not None:
-                            raw = "".join(el.itertext()).strip()
-                            if raw:
-                                summary = re.sub(r"<[^>]+>", "", raw)[:300]
-                                break
-
-                    # Relevance filter
-                    text = (title + " " + summary).lower()
-                    if not any(kw in text for kw in _IRAN_KEYWORDS):
+                    domain = art.get("domain", "")
+                    rel = _score_relevance(title, "")
+                    if rel < 0.05:
                         continue
 
                     all_items.append(NewsItem(
                         title=title,
-                        link=link,
+                        link=url or None,
                         published=published,
-                        source=source_name,
-                        summary=summary[:200] if summary else None,
+                        source=f"GDELT · {domain}" if domain else "GDELT",
+                        summary=None,
+                        relevance=rel,
                     ))
-                    feed_count += 1
 
-                logger.info("RSS %s: %d items (%d relevant)", source_name, len(items), feed_count)
+                logger.info("GDELT DOC '%s': %d articles", q, len(articles))
 
             except Exception as e:
-                logger.error("RSS feed %s failed: %s", source_name, e)
+                logger.error("GDELT DOC query '%s' failed: %s: %s", q, type(e).__name__, e)
 
-    all_items.sort(key=lambda x: x.published or "", reverse=True)
-    logger.info("Fetched %d relevant news items from RSS total", len(all_items))
     return all_items
+
+
+async def _fetch_x_news() -> list[NewsItem]:
+    """Fetch military/conflict tweets from X API v2 (paid, requires X_API_BEARER_TOKEN)."""
+    token = os.environ.get("X_API_BEARER_TOKEN", "").strip()
+    if not token or token == "your-x-bearer-token":
+        return []
+
+    # Query: last 7 days, military/conflict keywords
+    query = "(Iran OR Israel OR IDF OR Hezbollah OR Gaza) (airstrike OR missile OR military OR attack)"
+    url = "https://api.twitter.com/2/tweets/search/recent"
+    params = {
+        "query": query,
+        "max_results": 50,
+        "tweet.fields": "created_at,author_id,public_metrics",
+        "expansions": "author_id",
+        "user.fields": "username",
+    }
+
+    try:
+        async with httpx.AsyncClient(timeout=15.0) as client:
+            resp = await client.get(
+                url,
+                params=params,
+                headers={
+                    "Authorization": f"Bearer {token}",
+                    "User-Agent": "MilTrack/1.0 (military-aviation-tracker)",
+                },
+            )
+            if resp.status_code == 429:
+                logger.warning("X API rate limited (429)")
+                return []
+            if resp.status_code == 401:
+                logger.warning("X API unauthorized (401) — check bearer token")
+                return []
+            if resp.status_code == 403:
+                logger.warning("X API forbidden (403) — tier may not include search")
+                return []
+            if resp.status_code != 200:
+                logger.warning("X API returned %d", resp.status_code)
+                return []
+
+            data = resp.json()
+    except Exception as e:
+        logger.debug("X API request failed: %s", e)
+        return []
+
+    users: dict[str, str] = {}
+    for u in data.get("includes", {}).get("users", []):
+        uid = u.get("id")
+        uname = u.get("username", "")
+        if uid:
+            users[uid] = f"@{uname}" if uname else "X"
+
+    items: list[NewsItem] = []
+    for t in data.get("data", []):
+        text = (t.get("text") or "").strip()
+        if not text or len(text) < 20:
+            continue
+        tid = t.get("id", "")
+        created = t.get("created_at", "")
+        author_id = t.get("author_id", "")
+        source = users.get(author_id, "X")
+        link = f"https://x.com/i/status/{tid}" if tid else None
+        rel = _score_relevance(text[:200], "")
+        if rel < 0.05:
+            continue
+        items.append(NewsItem(
+            title=text[:120] + ("…" if len(text) > 120 else ""),
+            link=link,
+            published=created[:19] + "Z" if created and len(created) >= 19 else None,
+            source=source,
+            summary=text[:300] if len(text) > 120 else None,
+            relevance=rel,
+        ))
+
+    if items:
+        logger.info("X API: %d tweets", len(items))
+    return items
+
+
+_BRAVE_X_QUERIES = [
+    "Iran Israel military site:x.com",
+    "IDF Hezbollah airstrike site:x.com",
+    "Gaza missile strike site:x.com",
+]
+
+
+async def _fetch_brave_x_news() -> list[NewsItem]:
+    """Fetch X/tweet content via Brave web search (uses BRAVE_SEARCH_API_KEY, no X API needed)."""
+    api_key = os.environ.get("BRAVE_SEARCH_API_KEY", "").strip()
+    if not api_key or api_key == "your-brave-api-key":
+        return []
+
+    items: list[NewsItem] = []
+    seen_urls: set[str] = set()
+
+    async with httpx.AsyncClient(timeout=15.0) as client:
+        for q in _BRAVE_X_QUERIES:
+            try:
+                resp = await client.get(
+                    "https://api.search.brave.com/res/v1/web/search",
+                    params={
+                        "q": q,
+                        "count": "15",
+                        "freshness": "pw",
+                        "text_decorations": "false",
+                    },
+                    headers={
+                        "Accept": "application/json",
+                        "X-Subscription-Token": api_key,
+                    },
+                )
+                if resp.status_code == 401:
+                    logger.warning("Brave Search 401 — check BRAVE_SEARCH_API_KEY")
+                    return []
+                if resp.status_code == 429:
+                    logger.warning("Brave Search rate limited (429)")
+                    return []
+                if resp.status_code != 200:
+                    continue
+
+                data = resp.json()
+                results = data.get("web", {}).get("results", [])
+
+                for r in results:
+                    url = (r.get("url") or "").strip()
+                    if not url or "x.com" not in url and "twitter.com" not in url:
+                        continue
+                    if url in seen_urls:
+                        continue
+                    seen_urls.add(url)
+
+                    title = (r.get("title") or "").strip()
+                    desc = (r.get("description") or "").strip()
+                    text = f"{title} {desc}".strip()
+                    if len(text) < 30:
+                        continue
+
+                    rel = _score_relevance(text[:200], "")
+                    if rel < 0.05:
+                        continue
+
+                    age = r.get("age", "")
+                    published = age[:19] + "Z" if age and len(age) >= 19 else None
+
+                    items.append(NewsItem(
+                        title=title or text[:80] + ("…" if len(text) > 80 else ""),
+                        link=url,
+                        published=published,
+                        source="X (Brave)",
+                        summary=desc or None,
+                        relevance=rel,
+                    ))
+
+            except Exception as e:
+                logger.debug("Brave X search '%s' failed: %s", q[:30], e)
+
+    if items:
+        logger.info("Brave X search: %d items", len(items))
+    return items
+
+
+@router.get("/news", response_model=NewsResponse)
+async def get_military_news(limit: int = Query(75, ge=1, le=500)):
+    """Fetch latest military/conflict news from RSS feeds + GDELT DOC API."""
+    cache_key = "mil_news"
+    cached = _get_cached(cache_key, CACHE_TTL_NEWS)
+    if cached is not None:
+        items, sources_ok, sources_failed = cached
+        return NewsResponse(
+            items=items[:limit], total=len(items), cached=True,
+            sources_ok=sources_ok, sources_failed=sources_failed,
+        )
+
+    items, sources_ok, sources_failed = await _fetch_all_news()
+    _set_cache(cache_key, (items, sources_ok, sources_failed))
+    return NewsResponse(
+        items=items[:limit], total=len(items), cached=False,
+        sources_ok=sources_ok, sources_failed=sources_failed,
+    )
+
+
+async def _fetch_all_news() -> tuple[list[NewsItem], int, int]:
+    """Fetch all RSS feeds in parallel + GDELT DOC, merge, dedup, rank."""
+    sources_ok = 0
+    sources_failed = 0
+
+    async with httpx.AsyncClient(timeout=15.0, follow_redirects=True) as client:
+        tasks = [_fetch_single_rss(client, url, name) for url, name in _RSS_FEEDS]
+        results = await asyncio.gather(*tasks, return_exceptions=True)
+
+    all_items: list[NewsItem] = []
+    for result in results:
+        if isinstance(result, Exception):
+            sources_failed += 1
+            logger.error("RSS feed raised: %s", result)
+        else:
+            items, ok = result
+            all_items.extend(items)
+            if ok:
+                sources_ok += 1
+            else:
+                sources_failed += 1
+
+    try:
+        gdelt_items = await _fetch_gdelt_news()
+        all_items.extend(gdelt_items)
+        if gdelt_items:
+            sources_ok += 1
+    except Exception as e:
+        logger.error("GDELT DOC failed: %s", e)
+        sources_failed += 1
+
+    try:
+        x_items = await _fetch_x_news()
+        all_items.extend(x_items)
+        if x_items:
+            sources_ok += 1
+    except Exception as e:
+        logger.error("X API failed: %s", e)
+        sources_failed += 1
+
+    try:
+        brave_x_items = await _fetch_brave_x_news()
+        all_items.extend(brave_x_items)
+        if brave_x_items:
+            sources_ok += 1
+    except Exception as e:
+        logger.error("Brave X search failed: %s", e)
+        sources_failed += 1
+
+    all_items = _dedup_news(all_items)
+    all_items.sort(key=lambda x: (x.relevance, x.published or ""), reverse=True)
+
+    logger.info(
+        "News total: %d items from %d sources (%d failed)",
+        len(all_items), sources_ok, sources_failed,
+    )
+    return all_items, sources_ok, sources_failed
 
 
 # --- Aircraft info (Wikipedia) ---
@@ -1088,6 +1613,7 @@ _WIKI_MAP: dict[str, str] = {
     "C160": "Transall_C-160",
     "C17":  "Boeing_C-17_Globemaster_III",
     "C2":   "Kawasaki_C-2_(aircraft)",
+    "C27J": "Alenia_C-27J_Spartan",
     "C30J": "Lockheed_Martin_C-130J_Super_Hercules",
     "C5":   "Lockheed_C-5_Galaxy",
     "C5M":  "Lockheed_C-5_Galaxy",
@@ -1126,6 +1652,8 @@ _WIKI_MAP: dict[str, str] = {
     "RQ4":  "Northrop_Grumman_RQ-4_Global_Hawk",
     "U2":   "Lockheed_U-2",
     "V22":  "Bell_Boeing_V-22_Osprey",
+    "A139": "AgustaWestland_AW139",
+    "A169": "AgustaWestland_AW169",
     "A300": "Airbus_A300",
     "A310": "Airbus_A310",
     "A320": "Airbus_A320_family",
@@ -1147,6 +1675,10 @@ _WIKI_MAP: dict[str, str] = {
     "E145": "Embraer_ERJ_145_family",
     "LJ35": "Learjet_35",
     "P3":   "Lockheed_P-3_Orion",
+    "PC21": "Pilatus_PC-21",
+    "P180": "Piaggio_P.180_Avanti",
+    "FA7X": "Dassault_Falcon_7X",
+    "EC45": "Airbus_H145",
 }
 
 CACHE_TTL_WIKI = 86400  # 24 hours
@@ -1220,7 +1752,7 @@ async def _search_wiki_aircraft(type_code: str) -> AircraftInfo:
     """Fall back to Wikipedia search when type code isn't in the mapping."""
     if len(type_code) < 2:
         return AircraftInfo(type_code=type_code)
-    query = f"{type_code} military aircraft"
+    query = f"{type_code} aircraft"
     search_url = "https://en.wikipedia.org/w/api.php"
     params = {
         "action": "query",
@@ -1240,8 +1772,13 @@ async def _search_wiki_aircraft(type_code: str) -> AircraftInfo:
         if not results:
             return AircraftInfo(type_code=type_code)
 
-        title = results[0]["title"].replace(" ", "_")
-        return await _fetch_wiki_summary(type_code, title)
+        # Skip generic list pages (e.g. "List of active United States military aircraft")
+        for r in results:
+            title = r["title"]
+            if title.lower().startswith("list of ") or title.lower().startswith("lists of "):
+                continue
+            return await _fetch_wiki_summary(type_code, title.replace(" ", "_"))
+        return AircraftInfo(type_code=type_code)
     except Exception as e:
         logger.error("Wikipedia search failed for %s: %s", type_code, e)
         return AircraftInfo(type_code=type_code)

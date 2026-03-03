@@ -1,0 +1,16 @@
+command:
+  - uvicorn
+  - backend.app:app
+  - --host
+  - "0.0.0.0"
+  - --port
+  - "8000"
+env:
+  # Use workspace URL — app cannot reach ai-gateway.cloud.databricks.com (ConnectError)
+  - name: DATABRICKS_HOST
+    value: "https://e2-demo-field-eng.cloud.databricks.com"
+  # 5-model fallback chain — on 429 rate limit, switch to next
+  - name: DATABRICKS_LLM_MODEL
+    value: "databricks-claude-sonnet-4-6,databricks-meta-llama-3-1-70b-instruct,databricks-gemini-2-5-flash,databricks-claude-sonnet-4-5,databricks-claude-opus-4-6"
+  # DATABRICKS_TOKEN and BRAVE_SEARCH_API_KEY: set via Databricks App Resources (Secret Scope)
+  # Never commit secrets. See .env.example and DEPLOY.md.

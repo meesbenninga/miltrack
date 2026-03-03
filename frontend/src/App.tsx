@@ -7,6 +7,7 @@ import {
   fetchStrikes,
   fetchBases,
   fetchNews,
+  fetchIntel,
   fetchAircraftInfo,
   fetchTrail,
   classifyAircraft,
@@ -26,7 +27,12 @@ import {
   type StrikeEvent,
   type MilitaryBase,
   type NewsItem,
+  type IntelArticle,
   type MilCategory,
+  fetchSitrep,
+  type SitrepResponse,
+  fetchDeathToll,
+  type DeathTollResponse,
 } from "./tracker-api";
 import iranGeoJson from "./iran.geo.json";
 import israelGeoJson from "./israel.geo.json";
@@ -129,15 +135,131 @@ function aircraftIcon(
 }
 
 
-function strikeIcon(fatalities: number | null): L.DivIcon {
-  const s = fatalities && fatalities > 10 ? 18 : fatalities && fatalities > 0 ? 13 : 9;
+const DIRECTION_COLORS = {
+  to_iran:   { fill: "#3b82f6", border: "#2563eb", label: "STRIKE ON IRAN" },     // blue
+  from_iran: { fill: "#ef4444", border: "#dc2626", label: "IRANIAN ATTACK" },     // red
+  internal:  { fill: "#f59e0b", border: "#d97706", label: "INTERNAL" },            // amber
+  other:     { fill: "#8b5cf6", border: "#7c3aed", label: "OTHER" },              // purple
+  unknown:   { fill: "#6b7280", border: "#4b5563", label: "" },                    // gray
+} as const;
+
+function strikeClusterIcon(events: StrikeEvent[], enriched: boolean): L.DivIcon {
+  const top = events[0];
+  const isEnriched = enriched && top.title != null;
+
+  if (!isEnriched) {
+    const s = 8;
+    const count = events.length;
+    return L.divIcon({
+      className: "",
+      iconSize: [s, s],
+      iconAnchor: [s / 2, s / 2],
+      popupAnchor: [0, -s / 2],
+      html: `<div style="position:relative;width:${s}px;height:${s}px">
+        <div style="width:${s}px;height:${s}px;border-radius:50%;background:#6b7280;opacity:0.5;border:1px solid #888"></div>
+        ${count > 1 ? `<div style="position:absolute;top:-4px;right:-6px;background:#6b7280;color:#fff;font-size:7px;font-weight:700;border-radius:6px;min-width:12px;height:12px;display:flex;align-items:center;justify-content:center;padding:0 2px">${count}</div>` : ""}
+      </div>`,
+    });
+  }
+
+  const topSeverity = top.severity ?? 5;
+  const topConf = top.confidence ?? 0.7;
+  const topHours = top.hours_ago ?? 999;
+
+  const s = Math.max(10, Math.min(26, 6 + topSeverity * 2));
+  const freshness = Math.max(0.3, 1 - topHours / (90 * 24));
+  const dotOpacity = Math.max(0.3, Math.min(0.95, topConf * freshness));
+
+  const topDir = top.attack_direction ?? "unknown";
+  const topPalette = DIRECTION_COLORS[topDir] || DIRECTION_COLORS.unknown;
+  const glow = topSeverity >= 7 ? `box-shadow:0 0 ${topSeverity}px ${topPalette.fill}80` : "";
+
+  const uid = `sc-${Math.random().toString(36).slice(2, 8)}`;
+  const moreCount = events.length - 5;
+
+  const allRows = events.map((ev, i) => {
+    const dir = ev.attack_direction ?? "unknown";
+    const p = DIRECTION_COLORS[dir] || DIRECTION_COLORS.unknown;
+    const title = ev.title || ev.event_type || "";
+    const short = title.length > 35 ? title.slice(0, 33) + "…" : title;
+    const time = formatHoursAgo(ev.hours_ago);
+    const hidden = i >= 5 ? `class="${uid}-extra" style="display:none;align-items:center;gap:4px;padding:2px 0"` : `style="display:flex;align-items:center;gap:4px;padding:2px 0"`;
+    return `<div ${hidden}>
+      <span style="width:6px;height:6px;border-radius:50%;background:${p.fill};flex-shrink:0"></span>
+      <span style="color:${p.fill};font-weight:600">${short}</span>
+      ${time ? `<span style="color:#8888a0;margin-left:2px">· ${time}</span>` : ""}
+    </div>`;
+  });
+
+  if (moreCount > 0) {
+    allRows.push(
+      `<div id="${uid}-toggle" style="color:#3b82f6;padding:2px 0 0 10px;cursor:pointer;pointer-events:auto" onclick="
+        var extras=document.querySelectorAll('.${uid}-extra');
+        var show=extras[0]&&extras[0].style.display==='none';
+        extras.forEach(function(el){el.style.display=show?'flex':'none'});
+        this.textContent=show?'show less':'+${moreCount} more';
+        event.stopPropagation();
+      ">+${moreCount} more</div>`
+    );
+  }
+
+  const boxHtml = `<div style="position:absolute;top:${s + 3}px;left:50%;transform:translateX(-50%);
+    background:rgba(10,10,18,.92);border:1px solid #2a2a3a;border-radius:5px;padding:4px 8px;
+    white-space:nowrap;font-size:9px;line-height:1.4;pointer-events:none;
+    backdrop-filter:blur(4px);min-width:120px">${allRows.join("")}</div>`;
+
+  const boxHeight = Math.min(events.length, 5) * 16 + (moreCount > 0 ? 16 : 0) + 14;
+
   return L.divIcon({
     className: "",
-    iconSize: [s, s],
+    iconSize: [s, s + boxHeight],
     iconAnchor: [s / 2, s / 2],
     popupAnchor: [0, -s / 2],
-    html: `<div style="width:${s}px;height:${s}px;border-radius:50%;background:rgba(239,68,68,.7);border:1.5px solid #dc2626;box-shadow:0 0 8px rgba(239,68,68,.4)"></div>`,
+    html: `<div style="position:relative;width:${s}px;height:${s}px">
+      <div style="width:${s}px;height:${s}px;border-radius:50%;background:${topPalette.fill};opacity:${dotOpacity};border:1.5px solid ${topPalette.border};${glow}"></div>
+      ${events.length > 1 ? `<div style="position:absolute;top:-4px;right:-6px;background:#e4e4ef;color:#0a0a0f;font-size:8px;font-weight:700;border-radius:6px;min-width:14px;height:14px;display:flex;align-items:center;justify-content:center;padding:0 3px">${events.length}</div>` : ""}
+      ${boxHtml}</div>`,
   });
+}
+
+function formatHoursAgo(hours: number | null): string {
+  if (hours == null) return "";
+  if (hours < 1) return "< 1 hour ago";
+  if (hours < 24) return `${Math.round(hours)}h ago`;
+  const days = Math.floor(hours / 24);
+  if (days === 1) return "1 day ago";
+  if (days < 7) return `${days} days ago`;
+  const weeks = Math.floor(days / 7);
+  if (weeks === 1) return "1 week ago";
+  return `${weeks} weeks ago`;
+}
+
+function formatUpdatedAgo(date: Date | null): string {
+  if (!date) return "";
+  const mins = Math.floor((Date.now() - date.getTime()) / 60000);
+  if (mins < 1) return "updated just now";
+  if (mins < 60) return `updated ${mins}m ago`;
+  const hrs = Math.floor(mins / 60);
+  if (hrs === 1) return "updated 1h ago";
+  return `updated ${hrs}h ago`;
+}
+
+function formatPublishedAgo(isoDate: string | null): string {
+  if (!isoDate) return "";
+  try {
+    const ms = Date.now() - new Date(isoDate).getTime();
+    if (ms < 0) return "";
+    const mins = Math.floor(ms / 60000);
+    if (mins < 1) return "just now";
+    if (mins < 60) return `${mins}m ago`;
+    const hrs = Math.floor(mins / 60);
+    if (hrs < 24) return `${hrs}h ago`;
+    const days = Math.floor(hrs / 24);
+    if (days === 1) return "1 day ago";
+    return `${days} days ago`;
+  } catch {
+    return "";
+  }
 }
 
 const BASE_TYPE_META: Record<string, { color: string; svg: string; label: string }> = {
@@ -179,13 +301,51 @@ function SidePanel({
   aircraft,
   trail,
   onClose,
+  playbackTs,
+  onPlaybackTsChange,
+  playbackPlaying,
+  onPlaybackPlayingChange,
+  playbackPosition,
 }: {
   aircraft: AircraftPosition;
   trail: TrailPoint[];
   onClose: () => void;
+  playbackTs: number | null;
+  onPlaybackTsChange: (ts: number | null) => void;
+  playbackPlaying: boolean;
+  onPlaybackPlayingChange: (v: boolean) => void;
+  playbackPosition: { lat: number; lon: number; alt: number | null } | null;
 }) {
   const [info, setInfo] = useState<AircraftInfo | null>(null);
   const [infoLoading, setInfoLoading] = useState(false);
+  const playRef = useRef<ReturnType<typeof requestAnimationFrame> | null>(null);
+  const currentTsRef = useRef<number>(0);
+
+  // Playback animation
+  useEffect(() => {
+    if (!playbackPlaying || trail.length < 2) return;
+    const tStart = trail[0].ts;
+    const tEnd = trail[trail.length - 1].ts;
+    currentTsRef.current = playbackTs ?? tStart;
+    let lastT = performance.now();
+    const step = (now: number) => {
+      const dt = (now - lastT) / 1000;
+      lastT = now;
+      currentTsRef.current += dt;
+      if (currentTsRef.current >= tEnd) {
+        onPlaybackTsChange(tEnd);
+        onPlaybackPlayingChange(false);
+        return;
+      }
+      onPlaybackTsChange(currentTsRef.current);
+      playRef.current = requestAnimationFrame(step);
+    };
+    playRef.current = requestAnimationFrame(step);
+    return () => {
+      if (playRef.current) cancelAnimationFrame(playRef.current);
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps -- playbackTs only for initial value
+  }, [playbackPlaying, trail]);
 
   const cat = classifyAircraft(aircraft);
   const catMeta = CATEGORY_META[cat];
@@ -213,12 +373,11 @@ function SidePanel({
     trail.length > 1 ? Math.round((Date.now() / 1000 - trail[0].ts) / 60) : 0;
   const trailPct = Math.min(100, (trailDurationMin / 60) * 100);
 
+  const currentAlt = typeof aircraft.alt_baro === "number" ? aircraft.alt_baro : 0;
   const maxAlt =
     trail.length > 0
-      ? Math.max(...trail.map((p) => p.alt ?? 0))
-      : typeof aircraft.alt_baro === "number"
-        ? aircraft.alt_baro
-        : 0;
+      ? Math.max(...trail.map((p) => p.alt ?? 0), currentAlt)
+      : currentAlt;
 
   return (
     <>
@@ -376,6 +535,72 @@ function SidePanel({
           </div>
         </div>
 
+        {/* Playback of flight */}
+        {trail.length >= 2 && (
+          <div className="side-panel-section">
+            <div className="sp-label">Playback of flight</div>
+            <div style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 8 }}>
+              <button
+                type="button"
+                onClick={() => {
+                  if (playbackPlaying) {
+                    onPlaybackPlayingChange(false);
+                  } else {
+                    const tEnd = trail[trail.length - 1].ts;
+                    if ((playbackTs ?? 0) >= tEnd - 1) {
+                      onPlaybackTsChange(trail[0].ts);
+                    }
+                    onPlaybackPlayingChange(true);
+                  }
+                }}
+                style={{
+                  width: 32,
+                  height: 32,
+                  borderRadius: 6,
+                  border: "1px solid #2a2a3a",
+                  background: playbackPlaying ? "#3b82f633" : "#1a1a2a",
+                  color: catMeta.color,
+                  cursor: "pointer",
+                  fontSize: 14,
+                  display: "flex",
+                  alignItems: "center",
+                  justifyContent: "center",
+                }}
+              >
+                {playbackPlaying ? "⏸" : "▶"}
+              </button>
+              <div style={{ flex: 1, fontSize: 11, color: "#9ca3af" }}>
+                {playbackPosition ? (
+                  <>
+                    Alt {playbackPosition.alt != null ? `${Math.round(playbackPosition.alt).toLocaleString()} ft` : "—"}
+                    {playbackTs != null && (
+                      <span style={{ marginLeft: 8, color: "#6b7280" }}>
+                        {new Date(playbackTs * 1000).toISOString().slice(11, 19)} UTC
+                      </span>
+                    )}
+                  </>
+                ) : (
+                  "Drag to scrub"
+                )}
+              </div>
+            </div>
+            <input
+              type="range"
+              min={trail[0].ts}
+              max={trail[trail.length - 1].ts}
+              step={1}
+              value={playbackTs ?? trail[trail.length - 1].ts}
+              onChange={(e) => onPlaybackTsChange(parseFloat(e.target.value))}
+              style={{
+                width: "100%",
+                height: 6,
+                accentColor: catMeta.color,
+                cursor: "pointer",
+              }}
+            />
+          </div>
+        )}
+
         {/* Altitude profile (simple) */}
         {trail.length > 2 && (
           <div className="side-panel-section">
@@ -470,7 +695,7 @@ export function App() {
   const [bases, setBases] = useState<MilitaryBase[]>([]);
   const [loading, setLoading] = useState(false);
   const [lastUpdate, setLastUpdate] = useState("--");
-  const [globalView, setGlobalView] = useState(false);
+  const [globalView, setGlobalView] = useState(true);
   const [acVisible, setAcVisible] = useState<Record<MilCategory, boolean>>({
     tanker: true,
     awacs: true,
@@ -478,18 +703,45 @@ export function App() {
     recon: true,
     other: true,
   });
+  const [countryFilter, setCountryFilter] = useState<Record<string, boolean>>({});
+  const [countryFilterOpen, setCountryFilterOpen] = useState(false);
   const [showStrikes, setShowStrikes] = useState(true);
   const [strikeDays, setStrikeDays] = useState(90);
-  const [showBases, setShowBases] = useState(true);
+  const [showBases, setShowBases] = useState(false);
   const [hints, setHints] = useState<string[]>([]);
   const [hintsVisible, setHintsVisible] = useState(true);
 
   const [selectedHex, setSelectedHex] = useState<string | null>(null);
   const [trail, setTrail] = useState<TrailPoint[]>([]);
   const [followPos, setFollowPos] = useState<[number, number] | null>(null);
+  const [searchQuery, setSearchQuery] = useState("");
+  const [searchFocused, setSearchFocused] = useState(false);
+  const [playbackTs, setPlaybackTs] = useState<number | null>(null);
+  const [playbackPlaying, setPlaybackPlaying] = useState(false);
   const [news, setNews] = useState<NewsItem[]>([]);
+  const [intel, setIntel] = useState<IntelArticle[]>([]);
+  const [intelAvailable, setIntelAvailable] = useState(false);
+  const [intelUpdatedAt, setIntelUpdatedAt] = useState<Date | null>(null);
+  const [strikesUpdatedAt, setStrikesUpdatedAt] = useState<Date | null>(null);
+  const [strikesEnriched, setStrikesEnriched] = useState(false);
+  const [, setTick] = useState(0);
+
+  useEffect(() => {
+    const id = setInterval(() => setTick((t) => t + 1), 60_000);
+    return () => clearInterval(id);
+  }, []);
   const [showTable, setShowTable] = useState(false);
   const [showNews, setShowNews] = useState(false);
+  const [showSitrep, setShowSitrep] = useState(false);
+  const [sitrep, setSitrep] = useState<SitrepResponse | null>(null);
+  const [sitrepUpdatedAt, setSitrepUpdatedAt] = useState<Date | null>(null);
+  const [deathToll, setDeathToll] = useState<DeathTollResponse | null>(null);
+  const [showDeathTollModal, setShowDeathTollModal] = useState(false);
+  const [expandedDeathTollCountry, setExpandedDeathTollCountry] = useState<string | null>(null);
+
+  useEffect(() => {
+    if (!showDeathTollModal) setExpandedDeathTollCountry(null);
+  }, [showDeathTollModal]);
 
   const acTimer = useRef<ReturnType<typeof setInterval> | null>(null);
   const trailTimer = useRef<ReturnType<typeof setInterval> | null>(null);
@@ -513,6 +765,8 @@ export function App() {
     try {
       const d = await fetchStrikes({ days: strikeDays });
       setStrikes(d.events);
+      setStrikesEnriched(d.enriched);
+      setStrikesUpdatedAt(new Date());
       if (d.hint) setHints((prev) => (prev.includes(d.hint!) ? prev : [...prev, d.hint!]));
     } catch (e) {
       console.error(e);
@@ -530,10 +784,46 @@ export function App() {
 
   const loadNews = useCallback(async () => {
     try {
-      const d = await fetchNews(50);
+      const d = await fetchNews(75);
       setNews(d.items);
     } catch (e) {
       console.error(e);
+    }
+  }, []);
+
+  const loadIntel = useCallback(async () => {
+    try {
+      const d = await fetchIntel(20);
+      if (d.articles.length > 0) {
+        setIntel(d.articles);
+        setIntelAvailable(true);
+        setIntelUpdatedAt(new Date());
+      } else if (d.pipeline_status?.search?.includes("not set")) {
+        setIntelAvailable(false);
+      }
+    } catch {
+      // Intel pipeline not configured — that's fine
+    }
+  }, []);
+
+  const loadSitrep = useCallback(async () => {
+    try {
+      const d = await fetchSitrep();
+      if (d.threat_level !== "PENDING") {
+        setSitrep(d);
+        setSitrepUpdatedAt(new Date());
+      }
+    } catch {
+      // SITREP not ready yet
+    }
+  }, []);
+
+  const loadDeathToll = useCallback(async () => {
+    try {
+      const d = await fetchDeathToll();
+      if (d.by_country.length > 0) setDeathToll(d);
+    } catch {
+      // Death toll not available
     }
   }, []);
 
@@ -554,13 +844,22 @@ export function App() {
     loadStrikes();
     loadBases();
     loadNews();
+    loadIntel();
+    loadSitrep();
+    loadDeathToll();
     acTimer.current = setInterval(loadAircraft, AC_REFRESH);
-    const newsTimer = setInterval(loadNews, 900_000);
+    const newsTimer = setInterval(loadNews, 300_000);
+    const intelTimer = setInterval(loadIntel, 1_800_000);  // 30 min
+    const sitrepTimer = setInterval(loadSitrep, 300_000);  // poll every 5 min
+    const deathTollTimer = setInterval(loadDeathToll, 300_000);  // 5 min
     return () => {
       if (acTimer.current) clearInterval(acTimer.current);
       clearInterval(newsTimer);
+      clearInterval(intelTimer);
+      clearInterval(sitrepTimer);
+      clearInterval(deathTollTimer);
     };
-  }, [loadAircraft, loadStrikes, loadBases, loadNews]);
+  }, [loadAircraft, loadStrikes, loadBases, loadNews, loadIntel, loadSitrep, loadDeathToll]);
 
   useEffect(() => {
     if (selectedHex) {
@@ -574,15 +873,6 @@ export function App() {
     };
   }, [selectedHex, loadTrail]);
 
-  useEffect(() => {
-    if (!selectedHex) {
-      setFollowPos(null);
-      return;
-    }
-    const ac = aircraft.find((a) => a.hex === selectedHex);
-    if (ac?.lat != null && ac?.lon != null) setFollowPos([ac.lat, ac.lon]);
-  }, [aircraft, selectedHex]);
-
   // --- Handlers ---
 
   const selectAircraft = useCallback((hex: string | null) => {
@@ -593,11 +883,45 @@ export function App() {
     setSelectedHex(null);
   }, []);
 
+  const searchMatches = useMemo(() => {
+    if (!searchQuery.trim()) return aircraft;
+    const q = searchQuery.trim().toLowerCase();
+    return aircraft.filter((ac) => {
+      const flight = (ac.flight || "").toLowerCase();
+      const reg = (ac.registration || "").toLowerCase();
+      const hex = (ac.hex || "").toLowerCase();
+      const type = (ac.aircraft_type || "").toLowerCase();
+      const desc = (ac.description || "").toLowerCase();
+      return (
+        flight.includes(q) || reg.includes(q) || hex.includes(q) ||
+        type.includes(q) || desc.includes(q)
+      );
+    });
+  }, [aircraft, searchQuery]);
+
+  const filteredAircraft = useMemo(() => {
+    const byCountry = aircraft.filter((ac) => !ac.country_code || (countryFilter[ac.country_code] !== false));
+    if (!searchQuery.trim()) return byCountry;
+    const q = searchQuery.trim().toLowerCase();
+    return byCountry.filter((ac) => {
+      const flight = (ac.flight || "").toLowerCase();
+      const reg = (ac.registration || "").toLowerCase();
+      const hex = (ac.hex || "").toLowerCase();
+      const type = (ac.aircraft_type || "").toLowerCase();
+      const desc = (ac.description || "").toLowerCase();
+      return flight.includes(q) || reg.includes(q) || hex.includes(q) || type.includes(q) || desc.includes(q);
+    });
+  }, [aircraft, countryFilter, searchQuery]);
+
   const acCounts = useMemo(() => {
     const c: Record<MilCategory, number> = { tanker: 0, awacs: 0, transport: 0, recon: 0, other: 0 };
-    for (const ac of aircraft) c[classifyAircraft(ac)]++;
+    for (const ac of filteredAircraft) c[classifyAircraft(ac)]++;
     return c;
-  }, [aircraft]);
+  }, [filteredAircraft]);
+
+  const toggleCountry = useCallback((cc: string) => {
+    setCountryFilter((prev) => ({ ...prev, [cc]: !(prev[cc] ?? true) }));
+  }, []);
 
   const trailPositions: [number, number][] = useMemo(
     () => trail.map((p) => [p.lat, p.lon] as [number, number]),
@@ -607,6 +931,50 @@ export function App() {
   const selectedAc = selectedHex ? aircraft.find((a) => a.hex === selectedHex) : null;
   const selectedCat = selectedAc ? classifyAircraft(selectedAc) : null;
   const panelOpen = selectedAc != null || showTable || showNews;
+
+  // Playback: interpolate position at playbackTs from trail
+  const playbackPosition = useMemo((): { lat: number; lon: number; alt: number | null } | null => {
+    if (playbackTs == null || trail.length < 2) return null;
+    const idx = trail.findIndex((p) => p.ts >= playbackTs);
+    if (idx <= 0) return { lat: trail[0].lat, lon: trail[0].lon, alt: trail[0].alt ?? null };
+    if (idx >= trail.length) {
+      const last = trail[trail.length - 1];
+      return { lat: last.lat, lon: last.lon, alt: last.alt ?? null };
+    }
+    const a = trail[idx - 1];
+    const b = trail[idx];
+    const t = (playbackTs - a.ts) / (b.ts - a.ts);
+    return {
+      lat: a.lat + t * (b.lat - a.lat),
+      lon: a.lon + t * (b.lon - a.lon),
+      alt: a.alt != null && b.alt != null ? a.alt + t * (b.alt - a.alt) : a.alt ?? b.alt ?? null,
+    };
+  }, [playbackTs, trail]);
+
+  // Resolve display position for selected aircraft (playback or live)
+  const selectedAcDisplayPos: [number, number] | null = playbackPosition
+    ? [playbackPosition.lat, playbackPosition.lon]
+    : (selectedAc?.lat != null && selectedAc?.lon != null ? [selectedAc.lat, selectedAc.lon] : null);
+
+  // Sync followPos with selected aircraft (live or playback)
+  useEffect(() => {
+    if (!selectedHex) {
+      setFollowPos(null);
+      setPlaybackTs(null);
+      setPlaybackPlaying(false);
+      return;
+    }
+    if (playbackPosition) {
+      setFollowPos([playbackPosition.lat, playbackPosition.lon]);
+    } else {
+      const ac = aircraft.find((a) => a.hex === selectedHex);
+      if (ac?.lat != null && ac?.lon != null) setFollowPos([ac.lat, ac.lon]);
+    }
+  }, [aircraft, selectedHex, playbackPosition]);
+
+  useEffect(() => {
+    if (!selectedHex) setPlaybackTs(null);
+  }, [selectedHex]);
 
   // Iran conflict aircraft — scored by involvement level, sorted descending
   const conflictAircraft = useMemo(() => {
@@ -620,6 +988,28 @@ export function App() {
   const toggleCat = useCallback((cat: MilCategory) => {
     setAcVisible((p) => ({ ...p, [cat]: !p[cat] }));
   }, []);
+
+  // Group nearby strikes into clusters so overlapping dots stack neatly
+  type StrikeCluster = { lat: number; lon: number; events: StrikeEvent[] };
+  const strikeClusters: StrikeCluster[] = useMemo(() => {
+    const PROXIMITY = 0.15; // ~15 km at mid-latitudes
+    const geoStrikes = strikes.filter((e) => e.latitude != null && e.longitude != null);
+    const clusters: StrikeCluster[] = [];
+
+    for (const ev of geoStrikes) {
+      const match = clusters.find(
+        (c) => Math.abs(c.lat - ev.latitude!) < PROXIMITY && Math.abs(c.lon - ev.longitude!) < PROXIMITY,
+      );
+      if (match) {
+        match.events.push(ev);
+      } else {
+        clusters.push({ lat: ev.latitude!, lon: ev.longitude!, events: [ev] });
+      }
+    }
+    // Sort events inside each cluster by latest first (smallest hours_ago = most recent)
+    for (const c of clusters) c.events.sort((a, b) => (a.hours_ago ?? 999) - (b.hours_ago ?? 999));
+    return clusters;
+  }, [strikes]);
 
   // Compute trail dot positions (every ~5th point for visual dots along the path)
   const trailDots: { pos: [number, number]; opacity: number }[] = useMemo(() => {
@@ -706,18 +1096,21 @@ export function App() {
           ))}
 
         {/* Aircraft markers */}
-        {aircraft.map((ac) => {
+        {filteredAircraft.map((ac) => {
           const cat = classifyAircraft(ac);
-          if (!acVisible[cat] || ac.lat == null || ac.lon == null) return null;
           const isSelected = ac.hex === selectedHex;
+          const pos = isSelected && selectedAcDisplayPos
+            ? selectedAcDisplayPos
+            : (ac.lat != null && ac.lon != null ? [ac.lat, ac.lon] : null);
+          if (!acVisible[cat] || !pos) return null;
           const shape = getAircraftShape(ac);
           const label = ac.aircraft_type || ac.flight?.trim() || "";
           const flag = countryFlag(ac.country_code);
           const cName = countryName(ac.country_code);
           return (
             <Marker
-              key={ac.hex || `ac-${ac.lat}-${ac.lon}`}
-              position={[ac.lat, ac.lon]}
+              key={ac.hex || `ac-${pos[0]}-${pos[1]}`}
+              position={pos}
               icon={aircraftIcon(cat, shape, ac.track, label, flag, cName, isSelected)}
               eventHandlers={{
                 click: (e) => {
@@ -780,53 +1173,127 @@ export function App() {
             </Marker>
           ))}
 
-        {/* Strike markers */}
+        {/* Strike cluster markers */}
         {showStrikes &&
-          strikes.map((ev) => {
-            if (ev.latitude == null || ev.longitude == null) return null;
-            return (
-              <Marker
-                key={ev.event_id || `s-${ev.latitude}-${ev.longitude}-${ev.event_date}`}
-                position={[ev.latitude, ev.longitude]}
-                icon={strikeIcon(ev.fatalities)}
-              >
-                <Popup maxWidth={360}>
-                  <div style={{ fontSize: 12, lineHeight: 1.6 }}>
-                    <div style={{ fontWeight: 700, fontSize: 14 }}>
-                      {ev.sub_event_type || ev.event_type}
-                    </div>
-                    <div>
-                      {ev.event_date} &middot; {ev.country}
-                    </div>
-                    <div>
-                      {ev.location}
-                      {ev.admin1 ? `, ${ev.admin1}` : ""}
-                    </div>
-                    {ev.actor1 && <div>Actor: {ev.actor1}</div>}
-                    {ev.actor2 && <div>Target: {ev.actor2}</div>}
-                    {ev.fatalities != null && ev.fatalities > 0 && (
-                      <div style={{ color: "#ef4444", fontWeight: 600 }}>
-                        Fatalities: {ev.fatalities}
+          strikeClusters.map((cluster, ci) => (
+            <Marker
+              key={`sc-${ci}`}
+              position={[cluster.lat, cluster.lon]}
+              icon={strikeClusterIcon(cluster.events, strikesEnriched)}
+              eventHandlers={{
+                click: (e) => {
+                  const marker = e.target;
+                  marker.setZIndexOffset(10000);
+                  marker.once("popupclose", () => marker.setZIndexOffset(0));
+                },
+              }}
+            >
+              <Popup maxWidth={420}>
+                <div style={{ fontSize: 13, lineHeight: 1.6, maxHeight: 400, overflowY: "auto" }}>
+                  {cluster.events.map((ev, ei) => {
+                    const isEnriched = ev.title != null;
+                    const dir = ev.attack_direction ?? "unknown";
+                    const dirPalette = DIRECTION_COLORS[dir] || DIRECTION_COLORS.unknown;
+                    const sevColor = dirPalette.fill;
+                    const timeStr = formatHoursAgo(ev.hours_ago);
+                    const isNew = ev.hours_ago != null && ev.hours_ago < 0.5;
+                    return (
+                      <div key={ev.event_id || ei} style={{
+                        borderBottom: ei < cluster.events.length - 1 ? "1px solid #2a2a3a" : "none",
+                        paddingBottom: 10, marginBottom: 10,
+                      }}>
+                        <div style={{ fontWeight: 700, fontSize: 15, marginBottom: 2, display: "flex", alignItems: "center", gap: 8, flexWrap: "wrap" }}>
+                          {ev.title || ev.sub_event_type || ev.event_type}
+                          {isNew && (
+                            <span style={{
+                              fontSize: 9, fontWeight: 700, color: "#22c55e",
+                              background: "#22c55e22", border: "1px solid #22c55e60", borderRadius: 3,
+                              padding: "1px 5px", letterSpacing: 0.5,
+                            }}>
+                              NEW
+                            </span>
+                          )}
+                        </div>
+                        <div style={{ display: "flex", alignItems: "center", gap: 8, flexWrap: "wrap", fontSize: 12 }}>
+                          {dirPalette.label && (
+                            <span style={{
+                              background: `${dirPalette.fill}20`, border: `1px solid ${dirPalette.fill}60`,
+                              borderRadius: 3, padding: "0 6px", fontSize: 10, fontWeight: 700,
+                              color: dirPalette.fill, letterSpacing: 0.5,
+                            }}>
+                              {dirPalette.label}
+                            </span>
+                          )}
+                          {ev.event_date && <span>{ev.event_date}</span>}
+                          {ev.country && <span>&middot; {ev.country}</span>}
+                          {timeStr && (
+                            <span style={{
+                              background: "#1a1a2a", border: "1px solid #2a2a3a", borderRadius: 3,
+                              padding: "0 5px", fontSize: 10, color: "#8888a0",
+                            }}>
+                              {timeStr}
+                            </span>
+                          )}
+                        </div>
+                        {ev.location && (
+                          <div style={{ color: "#b0b0c0", fontSize: 12 }}>
+                            {ev.location}{ev.admin1 ? `, ${ev.admin1}` : ""}
+                          </div>
+                        )}
+                        {isEnriched && (
+                          <div style={{ display: "flex", gap: 8, marginTop: 6, alignItems: "center", flexWrap: "wrap" }}>
+                            {ev.severity != null && (
+                              <span style={{
+                                background: `${sevColor}20`, border: `1px solid ${sevColor}60`, borderRadius: 4,
+                                padding: "1px 8px", fontSize: 11, fontWeight: 700, color: sevColor,
+                              }}>
+                                Severity {ev.severity}/10
+                              </span>
+                            )}
+                            {ev.event_type && (
+                              <span style={{
+                                background: "#1a1a2a", border: "1px solid #2a2a3a", borderRadius: 3,
+                                padding: "1px 6px", fontSize: 10, color: "#b0b0c0", textTransform: "uppercase",
+                              }}>
+                                {ev.event_type.replace("_", " ")}
+                              </span>
+                            )}
+                            {ev.confidence != null && (
+                              <span style={{ fontSize: 10, color: "#8888a0" }}>
+                                {Math.round(ev.confidence * 100)}% confidence
+                              </span>
+                            )}
+                          </div>
+                        )}
+                        {ev.actor1 && <div style={{ marginTop: 4 }}>Actor: <b>{ev.actor1}</b></div>}
+                        {ev.actor2 && <div>Target: <b>{ev.actor2}</b></div>}
+                        {ev.fatalities != null && ev.fatalities > 0 && (
+                          <div style={{ color: "#ef4444", fontWeight: 600, marginTop: 4 }}>
+                            Estimated fatalities: {ev.fatalities}
+                          </div>
+                        )}
+                        {ev.summary && (
+                          <div style={{
+                            marginTop: 6, color: "#ccc", fontSize: 12, lineHeight: 1.5,
+                          }}>
+                            {ev.summary}
+                          </div>
+                        )}
+                        {!isEnriched && ev.notes && (
+                          <div style={{
+                            marginTop: 6, color: "#8888a0", maxHeight: 80,
+                            overflowY: "auto", fontSize: 11,
+                          }}>
+                            {ev.notes}
+                          </div>
+                        )}
                       </div>
-                    )}
-                    {ev.notes && (
-                      <div
-                        style={{
-                          marginTop: 6,
-                          color: "#8888a0",
-                          maxHeight: 80,
-                          overflowY: "auto",
-                          fontSize: 11,
-                        }}
-                      >
-                        {ev.notes}
-                      </div>
-                    )}
-                  </div>
-                </Popup>
-              </Marker>
-            );
-          })}
+                    );
+                  })}
+                </div>
+              </Popup>
+            </Marker>
+          ))}
       </MapContainer>
 
       {/* ---- Left side panel ---- */}
@@ -836,45 +1303,72 @@ export function App() {
             aircraft={selectedAc}
             trail={trail}
             onClose={deselectAll}
+            playbackTs={playbackTs}
+            onPlaybackTsChange={setPlaybackTs}
+            playbackPlaying={playbackPlaying}
+            onPlaybackPlayingChange={setPlaybackPlaying}
+            playbackPosition={playbackPosition}
           />
         )}
       </div>
 
-      {/* ---- Bottom panel: Conflict table or News feed ---- */}
-      {(showTable || showNews) && !selectedAc && (
+      {/* ---- Bottom panel: Conflict table, News feed, or SITREP ---- */}
+      {(showTable || showNews || showSitrep) && !selectedAc && (
         <div
           className="side-panel open"
-          style={{ width: 620, maxWidth: "55vw" }}
+          style={{ width: showSitrep ? 680 : 780, maxWidth: "62vw" }}
         >
-          <div className="sp-header">
-            <span style={{ fontWeight: 700, fontSize: 15, letterSpacing: 1 }}>
-              {showTable ? "IRAN CONFLICT — AIRCRAFT" : "MILITARY NEWS FEED"}
+          <div className="side-panel-header">
+            <span style={{ fontWeight: 700, fontSize: 16, letterSpacing: 1 }}>
+              {showTable ? "IRAN CONFLICT — AIRCRAFT" : showSitrep ? "AI SITUATION REPORT" : intelAvailable ? "AI INTELLIGENCE FEED" : "MILITARY NEWS FEED"}
             </span>
             <button
               className="sp-close"
-              onClick={() => { setShowTable(false); setShowNews(false); }}
+              onClick={() => { setShowTable(false); setShowNews(false); setShowSitrep(false); }}
             >
               ✕
             </button>
           </div>
-          <div className="sp-body" style={{ padding: "0 8px 12px" }}>
+          <div className="side-panel-body" style={{ padding: "0 14px 16px" }}>
             {showTable && (
               <>
-                <div style={{ fontSize: 10, color: "#8888a0", marginBottom: 8, lineHeight: 1.4 }}>
+                <div style={{ fontSize: 12, color: "#8888a0", marginBottom: 6, lineHeight: 1.5 }}>
                   Coalition aircraft ranked by how likely they are involved in the Iran conflict ({conflictAircraft.length} tracked).
-                  Main factor: distance to Iran. Multiplied by aircraft role.
                 </div>
+                <details style={{ marginBottom: 12, fontSize: 11, color: "#6b7280", background: "#0d0d15", border: "1px solid #1a1a2a", borderRadius: 6, padding: 0 }}>
+                  <summary style={{ padding: "6px 10px", cursor: "pointer", color: "#8888a0", fontWeight: 600, letterSpacing: 0.5 }}>How the conflict score works</summary>
+                  <div style={{ padding: "8px 10px 10px", lineHeight: 1.6, borderTop: "1px solid #1a1a2a" }}>
+                    <div style={{ marginBottom: 5 }}>
+                      Each aircraft gets a <b style={{ color: "#e4e4ef" }}>conflict score (0–100)</b> calculated from multiple factors:
+                    </div>
+                    <div style={{ marginBottom: 4 }}>
+                      <b style={{ color: "#3b82f6" }}>1. Distance to Iran</b> — Base score from proximity: in conflict zone (80+), near (60–79), far (40–59), very far (20–39). This is the primary factor.
+                    </div>
+                    <div style={{ marginBottom: 4 }}>
+                      <b style={{ color: "#3b82f6" }}>2. Aircraft role multiplier</b> — Surveillance ×1.4, Refueler ×1.6, Bomber ×1.8, Fighter ×1.5, Cargo ×1.0. Higher multipliers for aircraft types more directly involved in combat operations.
+                    </div>
+                    <div style={{ marginBottom: 4 }}>
+                      <b style={{ color: "#3b82f6" }}>3. Flight pattern</b> — Bonus for mission-like behavior: holding patterns, refueling tracks, low altitude in conflict zones.
+                    </div>
+                    <div style={{ marginBottom: 4 }}>
+                      <b style={{ color: "#3b82f6" }}>4. Country of origin</b> — Coalition nations (US, UK, Israel, France) score higher than non-coalition.
+                    </div>
+                    <div style={{ color: "#555", marginTop: 4, fontSize: 10 }}>
+                      Score labels: <span style={{ color: "#ef4444" }}>CRITICAL (80+)</span> · <span style={{ color: "#f59e0b" }}>HIGH (60–79)</span> · <span style={{ color: "#3b82f6" }}>MODERATE (40–59)</span> · <span style={{ color: "#6b7280" }}>LOW (&lt;40)</span>
+                    </div>
+                  </div>
+                </details>
                 <div style={{ overflowX: "auto" }}>
-                  <table style={{ width: "100%", borderCollapse: "collapse", fontSize: 11, tableLayout: "fixed" }}>
+                  <table style={{ width: "100%", borderCollapse: "collapse", fontSize: 11 }}>
                     <colgroup>
-                      <col style={{ width: 52 }} />
-                      <col style={{ width: 30 }} />
-                      <col style={{ width: 72 }} />
-                      <col style={{ width: 48 }} />
-                      <col style={{ width: 90 }} />
-                      <col />
-                      <col style={{ width: 56 }} />
-                      <col style={{ width: 48 }} />
+                      <col style={{ width: "7%" }} />
+                      <col style={{ width: "4%" }} />
+                      <col style={{ width: "12%" }} />
+                      <col style={{ width: "7%" }} />
+                      <col style={{ width: "14%" }} />
+                      <col style={{ width: "36%" }} />
+                      <col style={{ width: "10%" }} />
+                      <col style={{ width: "10%" }} />
                     </colgroup>
                     <thead>
                       <tr style={{ borderBottom: "1px solid #2a2a3a", color: "#8888a0", textAlign: "left" }}>
@@ -971,13 +1465,117 @@ export function App() {
                 </div>
               </>
             )}
-            {showNews && (
+            {showNews && intelAvailable && (
               <>
-                <div style={{ fontSize: 10, color: "#8888a0", marginBottom: 8, lineHeight: 1.4 }}>
-                  Latest military and Iran conflict news from RSS feeds ({news.length} items).
+                <div style={{ fontSize: 12, color: "#8888a0", marginBottom: 6, lineHeight: 1.5 }}>
+                  {intel.length} articles, latest first. {intelUpdatedAt && <span style={{ color: "#6b7280" }}>• {formatUpdatedAgo(intelUpdatedAt)}</span>}
+                </div>
+                <details style={{ marginBottom: 12, fontSize: 11, color: "#6b7280", background: "#0d0d15", border: "1px solid #1a1a2a", borderRadius: 6, padding: "0" }}>
+                  <summary style={{ padding: "6px 10px", cursor: "pointer", color: "#8888a0", fontWeight: 600, letterSpacing: 0.5 }}>How AI Intel works</summary>
+                  <div style={{ padding: "8px 10px 10px", lineHeight: 1.6, borderTop: "1px solid #1a1a2a" }}>
+                    <div style={{ marginBottom: 6 }}>
+                      <b style={{ color: "#f59e0b" }}>1. Search</b> — Brave Search API finds the latest military news articles across the web (4 targeted queries every 2 hours).
+                    </div>
+                    <div style={{ marginBottom: 6 }}>
+                      <b style={{ color: "#f59e0b" }}>2. Extract</b> — Jina Reader API extracts full article text from each URL, stripping ads and navigation.
+                    </div>
+                    <div style={{ marginBottom: 6 }}>
+                      <b style={{ color: "#f59e0b" }}>3. Analyze</b> — A Databricks-hosted LLM (Claude) reads each article and returns: a relevance score (0–100), category (airstrike, deployment, naval, etc.), entity extraction (countries, weapons, actors), an intelligence summary, and how the article connects to observable aircraft activity.
+                    </div>
+                    <div style={{ marginBottom: 6 }}>
+                      <b style={{ color: "#f59e0b" }}>4. Rank</b> — Articles are ordered by latest first, then relevance: <span style={{ color: "#ef4444" }}>CRITICAL (80+)</span> = active operations, <span style={{ color: "#f59e0b" }}>HIGH (50–79)</span> = force posture changes, <span style={{ color: "#3b82f6" }}>MODERATE (25–49)</span> = political/military implications.
+                    </div>
+                    <div style={{ color: "#555", marginTop: 4, fontSize: 10 }}>
+                      Unlike the <b style={{ color: "#f59e0b" }}>Live Feed</b> in the right panel (raw RSS headlines in real-time), AI Intel deeply analyzes each article for operational significance.
+                    </div>
+                  </div>
+                </details>
+                {intel.map((art, i) => {
+                  const sColor = art.relevance_score >= 80 ? "#ef4444" : art.relevance_score >= 50 ? "#f59e0b" : "#3b82f6";
+                  const sLabel = art.relevance_score >= 80 ? "CRITICAL" : art.relevance_score >= 50 ? "HIGH" : "MODERATE";
+                  const isNew = art.hours_ago != null && art.hours_ago < 0.5;
+                  return (
+                    <div key={i} style={{ borderBottom: "1px solid #1a1a2a", padding: "14px 0" }}>
+                      <div style={{ display: "flex", alignItems: "flex-start", gap: 12 }}>
+                        <div style={{
+                          minWidth: 46, textAlign: "center", padding: "4px 0",
+                          borderRadius: 6, border: `1px solid ${sColor}40`, background: `${sColor}15`,
+                        }}>
+                          <div style={{ fontSize: 18, fontWeight: 700, color: sColor, fontVariantNumeric: "tabular-nums" }}>
+                            {art.relevance_score}
+                          </div>
+                          <div style={{ fontSize: 9, fontWeight: 600, color: sColor, opacity: 0.8 }}>{sLabel}</div>
+                        </div>
+                        <div style={{ flex: 1 }}>
+                          <a
+                            href={art.url || "#"} target="_blank" rel="noopener noreferrer"
+                            style={{ color: "#e4e4ef", textDecoration: "none", fontWeight: 600, fontSize: 15, lineHeight: 1.4, display: "block" }}
+                            onMouseEnter={(e) => (e.currentTarget.style.color = "#3b82f6")}
+                            onMouseLeave={(e) => (e.currentTarget.style.color = "#e4e4ef")}
+                          >
+                            {art.title}
+                            {isNew && (
+                              <span style={{
+                                marginLeft: 8, fontSize: 9, fontWeight: 700, color: "#22c55e",
+                                background: "#22c55e22", border: "1px solid #22c55e60", borderRadius: 3,
+                                padding: "1px 5px", verticalAlign: "middle", letterSpacing: 0.5,
+                              }}>
+                                NEW
+                              </span>
+                            )}
+                          </a>
+                          <div style={{ fontSize: 12, color: "#8888a0", marginTop: 4, display: "flex", alignItems: "center", gap: 8, flexWrap: "wrap" }}>
+                            <span style={{ color: "#f59e0b", fontWeight: 500 }}>{art.source_domain}</span>
+                            {art.published && <span>· {art.published}</span>}
+                            {art.category && (
+                              <span style={{
+                                background: "#1a1a2a", border: "1px solid #2a2a3a", borderRadius: 3,
+                                padding: "1px 7px", fontSize: 10, color: "#b0b0c0", textTransform: "uppercase", fontWeight: 600,
+                              }}>
+                                {art.category.replace("_", " ")}
+                              </span>
+                            )}
+                          </div>
+                          {art.summary && (
+                            <div style={{ fontSize: 13, color: "#ccc", marginTop: 6, lineHeight: 1.6 }}>
+                              {art.summary}
+                            </div>
+                          )}
+                          {art.map_connection && (
+                            <div style={{
+                              fontSize: 12, color: "#3b82f6", marginTop: 6, lineHeight: 1.5,
+                              background: "#3b82f610", border: "1px solid #3b82f630", borderRadius: 5, padding: "6px 10px",
+                            }}>
+                              MAP: {art.map_connection}
+                            </div>
+                          )}
+                          {art.entities && (
+                            <div style={{ display: "flex", gap: 5, flexWrap: "wrap", marginTop: 6 }}>
+                              {art.entities.countries?.map((c) => (
+                                <span key={c} style={{ fontSize: 11, background: "#1a1a2a", border: "1px solid #2a2a3a", borderRadius: 4, padding: "1px 6px", color: "#999" }}>{c}</span>
+                              ))}
+                              {art.entities.weapons_platforms?.map((w) => (
+                                <span key={w} style={{ fontSize: 11, background: "#f59e0b15", border: "1px solid #f59e0b30", borderRadius: 4, padding: "1px 6px", color: "#f59e0b" }}>{w}</span>
+                              ))}
+                              {art.entities.actors?.map((a) => (
+                                <span key={a} style={{ fontSize: 11, background: "#a855f715", border: "1px solid #a855f730", borderRadius: 4, padding: "1px 6px", color: "#a855f7" }}>{a}</span>
+                              ))}
+                            </div>
+                          )}
+                        </div>
+                      </div>
+                    </div>
+                  );
+                })}
+              </>
+            )}
+            {showNews && !intelAvailable && (
+              <>
+                <div style={{ fontSize: 12, color: "#8888a0", marginBottom: 10, lineHeight: 1.5 }}>
+                  Military &amp; conflict news from 14+ RSS feeds (incl. Fox, CNN, Guardian, Times) + GDELT DOC ({news.length} articles, ranked by relevance).
                 </div>
                 {news.length === 0 && (
-                  <div style={{ color: "#666", fontSize: 12, padding: 16, textAlign: "center" }}>
+                  <div style={{ color: "#666", fontSize: 14, padding: 16, textAlign: "center" }}>
                     Loading news...
                   </div>
                 )}
@@ -986,7 +1584,7 @@ export function App() {
                     key={i}
                     style={{
                       borderBottom: "1px solid #1a1a2a",
-                      padding: "8px 0",
+                      padding: "12px 0",
                     }}
                   >
                     <a
@@ -997,7 +1595,7 @@ export function App() {
                         color: "#e4e4ef",
                         textDecoration: "none",
                         fontWeight: 600,
-                        fontSize: 12,
+                        fontSize: 15,
                         lineHeight: 1.4,
                         display: "block",
                       }}
@@ -1006,19 +1604,121 @@ export function App() {
                     >
                       {item.title}
                     </a>
-                    <div style={{ fontSize: 10, color: "#8888a0", marginTop: 2 }}>
-                      <span style={{ color: "#f59e0b" }}>{item.source}</span>
+                    <div style={{ fontSize: 12, color: "#8888a0", marginTop: 4, display: "flex", alignItems: "center", gap: 8 }}>
+                      <span style={{ color: "#f59e0b", fontWeight: 500 }}>{item.source}</span>
                       {item.published && (
-                        <span> · {item.published.replace(/\+0000|GMT/g, "").trim().slice(0, 22)}</span>
+                        <span>· {item.published.replace(/\+0000|GMT|T|Z/g, " ").trim().slice(0, 16)}</span>
+                      )}
+                      {item.relevance >= 0.5 && (
+                        <span style={{
+                          background: item.relevance >= 0.7 ? "#dc262633" : "#f59e0b22",
+                          border: `1px solid ${item.relevance >= 0.7 ? "#dc2626" : "#f59e0b"}`,
+                          borderRadius: 4, padding: "1px 7px", fontSize: 10, fontWeight: 600,
+                          color: item.relevance >= 0.7 ? "#fca5a5" : "#fcd34d",
+                        }}>
+                          {item.relevance >= 0.7 ? "HIGH" : "MED"}
+                        </span>
                       )}
                     </div>
                     {item.summary && (
-                      <div style={{ fontSize: 10, color: "#666", marginTop: 3, lineHeight: 1.4 }}>
-                        {item.summary.slice(0, 150)}...
+                      <div style={{ fontSize: 13, color: "#888", marginTop: 5, lineHeight: 1.5 }}>
+                        {item.summary.slice(0, 200)}...
                       </div>
                     )}
                   </div>
                 ))}
+              </>
+            )}
+            {showSitrep && (
+              <>
+                {!sitrep ? (
+                  <div style={{ color: "#8888a0", fontSize: 14, padding: 24, textAlign: "center" }}>
+                    Generating situation report... This runs every 2 hours.
+                    <br />
+                    <span style={{ fontSize: 12, color: "#555" }}>The first report is generated ~3 minutes after server start.</span>
+                  </div>
+                ) : (
+                  <div style={{ lineHeight: 1.6 }}>
+                    <div style={{ display: "flex", alignItems: "center", gap: 10, marginBottom: 14 }}>
+                      <span style={{
+                        padding: "4px 14px",
+                        borderRadius: 6,
+                        fontWeight: 800,
+                        fontSize: 14,
+                        letterSpacing: 1,
+                        color: "#fff",
+                        background:
+                          sitrep.threat_level === "CRITICAL" ? "#dc2626" :
+                          sitrep.threat_level === "HIGH" ? "#ea580c" :
+                          sitrep.threat_level === "MODERATE" ? "#ca8a04" : "#16a34a",
+                      }}>
+                        {sitrep.threat_level}
+                      </span>
+                      <span style={{ fontSize: 12, color: "#6b7280", display: "inline-flex", alignItems: "center", gap: 8 }}>
+                        {sitrep.generated_at}
+                        {sitrep.generated_at_ts != null && (Date.now() / 1000 - sitrep.generated_at_ts) < 1800 && (
+                          <span style={{
+                            fontSize: 9, fontWeight: 700, color: "#22c55e",
+                            background: "#22c55e22", border: "1px solid #22c55e60", borderRadius: 3,
+                            padding: "1px 5px", letterSpacing: 0.5,
+                          }}>
+                            NEW
+                          </span>
+                        )}
+                        {sitrepUpdatedAt && <> · {formatUpdatedAgo(sitrepUpdatedAt)}</>}
+                      </span>
+                    </div>
+
+                    <details style={{ marginBottom: 14, fontSize: 11, color: "#6b7280", background: "#0d0d15", border: "1px solid #1a1a2a", borderRadius: 6, padding: 0 }}>
+                      <summary style={{ padding: "6px 10px", cursor: "pointer", color: "#8888a0", fontWeight: 600, letterSpacing: 0.5 }}>How the SITREP works</summary>
+                      <div style={{ padding: "8px 10px 10px", lineHeight: 1.6, borderTop: "1px solid #1a1a2a" }}>
+                        <div style={{ marginBottom: 5 }}>
+                          The SITREP is generated every 2 hours by a Databricks-hosted LLM that synthesizes <b style={{ color: "#c4b5fd" }}>all three data streams</b> into one intelligence briefing:
+                        </div>
+                        <div style={{ marginBottom: 4 }}>
+                          <b style={{ color: "#3b82f6" }}>Aircraft</b> — All currently tracked military aircraft (type, position, country, altitude, speed) are sent to the LLM without pre-filtering, letting the AI assess which movements are operationally significant.
+                        </div>
+                        <div style={{ marginBottom: 4 }}>
+                          <b style={{ color: "#ef4444" }}>Strikes</b> — The latest AI-verified conflict events from the last 24 hours, with severity and direction data.
+                        </div>
+                        <div style={{ marginBottom: 4 }}>
+                          <b style={{ color: "#f59e0b" }}>News</b> — Top AI Intel articles with relevance scores and summaries.
+                        </div>
+                        <div style={{ color: "#555", marginTop: 4, fontSize: 10 }}>
+                          The LLM cross-references these streams to identify patterns, connections between aircraft activity and strikes, and produces a threat level assessment with forward-looking analysis.
+                        </div>
+                      </div>
+                    </details>
+
+                    <div style={{ fontSize: 15, color: "#e4e4ef", fontWeight: 600, marginBottom: 16, lineHeight: 1.6 }}>
+                      {sitrep.executive_summary}
+                    </div>
+
+                    {([
+                      { label: "AIRCRAFT SITUATION", text: sitrep.aircraft_situation, color: "#3b82f6" },
+                      { label: "CONFLICT SITUATION", text: sitrep.conflict_situation, color: "#ef4444" },
+                      { label: "KEY DEVELOPMENTS", text: sitrep.key_developments, color: "#f59e0b" },
+                      { label: "ASSESSMENT", text: sitrep.assessment, color: "#8b5cf6" },
+                      ...(sitrep.connections ? [{ label: "CONNECTIONS", text: sitrep.connections, color: "#06b6d4" }] : []),
+                    ] as { label: string; text: string; color: string }[]).map((section) => (
+                      <div key={section.label} style={{ marginBottom: 14 }}>
+                        <div style={{
+                          fontSize: 11,
+                          fontWeight: 700,
+                          letterSpacing: 1.5,
+                          color: section.color,
+                          marginBottom: 4,
+                          textTransform: "uppercase" as const,
+                        }}>
+                          {section.label}
+                        </div>
+                        <div style={{ fontSize: 13, color: "#c4c4d4", whiteSpace: "pre-wrap" }}>
+                          {section.text}
+                        </div>
+                      </div>
+                    ))}
+                  </div>
+                )}
               </>
             )}
           </div>
@@ -1035,14 +1735,96 @@ export function App() {
           display: "flex",
           alignItems: "center",
           gap: 8,
+          flexWrap: "wrap",
+          maxWidth: "calc(100vw - 48px)",
           transition: "left 0.3s cubic-bezier(0.4,0,0.2,1)",
         }}
       >
-        <div style={panelStyle}>
+        <div style={{ ...panelStyle, flexWrap: "wrap", rowGap: 8, alignItems: "center" }}>
           <span style={{ fontWeight: 700, letterSpacing: 1 }}>MILTRACK</span>
           <D />
+          <div style={{ position: "relative" }}>
+            <input
+              type="text"
+              placeholder="Find flights, hex, registration..."
+              value={searchQuery}
+              onChange={(e) => setSearchQuery(e.target.value)}
+              onFocus={() => setSearchFocused(true)}
+              onBlur={() => setTimeout(() => setSearchFocused(false), 150)}
+              onKeyDown={(e) => {
+                if (e.key === "Enter" && searchMatches.length === 1) {
+                  selectAircraft(searchMatches[0].hex);
+                  setSearchQuery("");
+                  setSearchFocused(false);
+                }
+              }}
+              style={{
+                width: 200,
+                padding: "6px 10px",
+                background: "#0d0d15",
+                border: "1px solid #2a2a3a",
+                borderRadius: 6,
+                color: "#e4e4ef",
+                fontSize: 12,
+                outline: "none",
+              }}
+            />
+            {searchFocused && searchQuery.trim() && searchMatches.length > 0 && (
+              <div
+                style={{
+                  position: "absolute",
+                  top: "100%",
+                  left: 0,
+                  marginTop: 4,
+                  minWidth: 260,
+                  maxHeight: 240,
+                  overflowY: "auto",
+                  background: "#0d0d15",
+                  border: "1px solid #2a2a3a",
+                  borderRadius: 8,
+                  boxShadow: "0 8px 24px rgba(0,0,0,0.5)",
+                  zIndex: 2000,
+                }}
+              >
+                {searchMatches.slice(0, 10).map((ac) => (
+                  <button
+                    key={ac.hex}
+                    type="button"
+                    onClick={() => {
+                      selectAircraft(ac.hex);
+                      setSearchQuery("");
+                      setSearchFocused(false);
+                    }}
+                    style={{
+                      width: "100%",
+                      padding: "8px 12px",
+                      textAlign: "left",
+                      background: "none",
+                      border: "none",
+                      borderBottom: "1px solid #1a1a2a",
+                      color: "#e4e4ef",
+                      cursor: "pointer",
+                      fontSize: 12,
+                      display: "flex",
+                      justifyContent: "space-between",
+                      alignItems: "center",
+                    }}
+                  >
+                    <span>{ac.flight?.trim() || "—"} · {ac.registration || ac.hex || "—"}</span>
+                    <span style={{ color: "#6b7280", fontSize: 11 }}>{ac.aircraft_type || ""}</span>
+                  </button>
+                ))}
+                {searchMatches.length > 10 && (
+                  <div style={{ padding: "6px 12px", fontSize: 10, color: "#6b7280" }}>
+                    +{searchMatches.length - 10} more — refine search
+                  </div>
+                )}
+              </div>
+            )}
+          </div>
+          <D />
           <span>
-            <b style={mono}>{aircraft.length}</b> aircraft
+            <b style={mono}>{filteredAircraft.length}</b> aircraft
           </span>
           <D />
           <span>
@@ -1052,6 +1834,42 @@ export function App() {
           <span>
             <b style={{ ...mono, color: "#f59e0b" }}>{bases.length}</b> bases
           </span>
+          {deathToll && deathToll.by_country.length > 0 && (() => {
+            const total = deathToll.by_country.reduce((s, r) => s + (r.ucdp_best ?? r.gdelt_total ?? 0), 0);
+            return (
+              <>
+                <D />
+                <button
+                  type="button"
+                  onClick={() => setShowDeathTollModal(true)}
+                  style={{
+                    display: "inline-flex",
+                    alignItems: "center",
+                    gap: 4,
+                    padding: "4px 10px",
+                    background: "#1a1a2a",
+                    borderRadius: 6,
+                    border: "1px solid #2a2a3a",
+                    cursor: "pointer",
+                    color: "inherit",
+                    font: "inherit",
+                  }}
+                  onMouseEnter={(e) => {
+                    e.currentTarget.style.background = "#252535";
+                    e.currentTarget.style.borderColor = "#dc262640";
+                  }}
+                  onMouseLeave={(e) => {
+                    e.currentTarget.style.background = "#1a1a2a";
+                    e.currentTarget.style.borderColor = "#2a2a3a";
+                  }}
+                >
+                  <b style={{ ...mono, color: "#dc2626", fontSize: 12 }}>{total.toLocaleString()}</b>
+                  <span style={{ color: "#9ca3af", fontSize: 11 }}>deaths</span>
+                  <span style={{ fontSize: 10, color: "#6b7280", marginLeft: 2 }}>▼</span>
+                </button>
+              </>
+            );
+          })()}
           <D />
           <span
             style={{
@@ -1071,7 +1889,7 @@ export function App() {
           </button>
           <D />
           <button
-            onClick={() => { setShowTable(!showTable); setShowNews(false); }}
+            onClick={() => { setShowTable(!showTable); setShowNews(false); setShowSitrep(false); }}
             style={{
               ...toggleBtnStyle,
               background: showTable ? "#dc262633" : "#1a1a2a",
@@ -1083,7 +1901,7 @@ export function App() {
           </button>
           <D />
           <button
-            onClick={() => { setShowNews(!showNews); setShowTable(false); }}
+            onClick={() => { setShowNews(!showNews); setShowTable(false); setShowSitrep(false); }}
             style={{
               ...toggleBtnStyle,
               background: showNews ? "#f59e0b22" : "#1a1a2a",
@@ -1091,10 +1909,180 @@ export function App() {
               color: showNews ? "#fcd34d" : "#e4e4ef",
             }}
           >
-            NEWS {news.length > 0 ? `(${news.length})` : ""}
+            {intelAvailable ? "AI INTEL" : "NEWS"} {intelAvailable ? `(${intel.length})` : news.length > 0 ? `(${news.length})` : ""}
+          </button>
+          <D />
+          <button
+            onClick={() => { setShowSitrep(!showSitrep); setShowTable(false); setShowNews(false); }}
+            style={{
+              ...toggleBtnStyle,
+              background: showSitrep ? "#8b5cf622" : "#1a1a2a",
+              borderColor: showSitrep ? "#8b5cf6" : "#3a3a5a",
+              color: showSitrep ? "#c4b5fd" : "#e4e4ef",
+            }}
+          >
+            SITREP {sitrep ? `(${sitrep.threat_level})` : ""}
           </button>
         </div>
       </div>
+
+      {/* ---- Death toll modal (click to open) ---- */}
+      {showDeathTollModal && deathToll && deathToll.by_country.length > 0 && (
+        <div
+          style={{
+            position: "fixed",
+            inset: 0,
+            zIndex: 2000,
+            display: "flex",
+            alignItems: "center",
+            justifyContent: "center",
+            background: "rgba(0,0,0,0.6)",
+            backdropFilter: "blur(4px)",
+          }}
+          onClick={() => setShowDeathTollModal(false)}
+        >
+          <div
+            style={{
+              background: "#0d0d15",
+              border: "1px solid #2a2a3a",
+              borderRadius: 12,
+              padding: 24,
+              maxWidth: 420,
+              width: "90vw",
+              maxHeight: "80vh",
+              overflowY: "auto",
+              boxShadow: "0 20px 60px rgba(0,0,0,0.5)",
+            }}
+            onClick={(e) => e.stopPropagation()}
+          >
+            <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 16 }}>
+              <h3 style={{ margin: 0, fontSize: 18, fontWeight: 700, color: "#e4e4ef" }}>Death toll by country</h3>
+              {expandedDeathTollCountry && (
+                <button type="button" onClick={() => setExpandedDeathTollCountry(null)} style={{ background: "none", border: "none", color: "#8888a0", cursor: "pointer", fontSize: 11 }}>Collapse</button>
+              )}
+              <button
+                type="button"
+                onClick={() => setShowDeathTollModal(false)}
+                style={{
+                  background: "none",
+                  border: "none",
+                  color: "#8888a0",
+                  cursor: "pointer",
+                  fontSize: 20,
+                  padding: 4,
+                  lineHeight: 1,
+                }}
+              >
+                ×
+              </button>
+            </div>
+            <div style={{ fontSize: 11, color: "#6b7280", marginBottom: 16, lineHeight: 1.4 }}>
+              {deathToll.ucdp_available ? "UCDP verified + GDELT" : "GDELT (AI-enriched)"} · {deathToll.period}
+            </div>
+            <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
+              {deathToll.by_country.map((row) => {
+                const isExpanded = expandedDeathTollCountry === row.country;
+                const hasUcdp = row.ucdp_best != null && row.ucdp_best > 0;
+                const hasGdelt = row.gdelt_total != null && row.gdelt_total > 0;
+                return (
+                  <div
+                    key={row.country}
+                    style={{
+                      background: "#1a1a2a",
+                      borderRadius: 8,
+                      border: "1px solid #2a2a3a",
+                      overflow: "hidden",
+                    }}
+                  >
+                    <button
+                      type="button"
+                      onClick={() => setExpandedDeathTollCountry(isExpanded ? null : row.country)}
+                      style={{
+                        width: "100%",
+                        display: "flex",
+                        justifyContent: "space-between",
+                        alignItems: "center",
+                        padding: "10px 12px",
+                        background: "none",
+                        border: "none",
+                        cursor: "pointer",
+                        color: "inherit",
+                        font: "inherit",
+                        textAlign: "left",
+                      }}
+                    >
+                      <span style={{ color: "#e4e4ef", fontWeight: 600, fontSize: 14 }}>{row.country}</span>
+                      <span style={{ display: "flex", alignItems: "center", gap: 8 }}>
+                        {hasUcdp && (
+                          <span style={{ color: "#22c55e", fontWeight: 700, fontSize: 15, fontVariantNumeric: "tabular-nums" }}>
+                            {row.ucdp_best!.toLocaleString()}
+                            {row.ucdp_low != null && row.ucdp_high != null && row.ucdp_low !== row.ucdp_high && (
+                              <span style={{ fontSize: 11, color: "#6b7280", fontWeight: 400, marginLeft: 6 }}>
+                                ({row.ucdp_low}–{row.ucdp_high})
+                              </span>
+                            )}
+                          </span>
+                        )}
+                        {hasGdelt && (
+                          <span style={{
+                            background: "#0d0d15",
+                            border: "1px solid #2a2a3a",
+                            borderRadius: 4,
+                            padding: "2px 8px",
+                            fontSize: 11,
+                            color: "#9ca3af",
+                            fontVariantNumeric: "tabular-nums",
+                          }}>
+                            GDELT: {row.gdelt_total}
+                          </span>
+                        )}
+                        <span style={{ fontSize: 10, color: "#6b7280" }}>{isExpanded ? "▲" : "▼"}</span>
+                      </span>
+                    </button>
+                    {isExpanded && (
+                      <div style={{ padding: "8px 12px 12px", borderTop: "1px solid #2a2a3a", background: "#0d0d15", fontSize: 11, color: "#9ca3af", lineHeight: 1.6 }}>
+                        {hasUcdp && (
+                          <div style={{ marginBottom: 8 }}>
+                            <div style={{ fontWeight: 600, color: "#22c55e", marginBottom: 4 }}>UCDP (verified)</div>
+                            <div style={{ marginBottom: 4 }}>
+                              Uppsala Conflict Data Program — peer-reviewed, verified battle-related deaths. Data is cross-checked against multiple sources.
+                            </div>
+                            <a href="https://ucdp.uu.se/" target="_blank" rel="noopener noreferrer" style={{ color: "#3b82f6", marginRight: 12 }}>ucdp.uu.se</a>
+                          </div>
+                        )}
+                        {hasGdelt && (
+                          <div>
+                            <div style={{ fontWeight: 600, color: "#f59e0b", marginBottom: 4 }}>GDELT (AI-enriched)</div>
+                            <div style={{ marginBottom: 4 }}>
+                              Fatalities inferred by LLM from GDELT conflict events. Unverified — estimates from news coding.
+                            </div>
+                            <a href="https://www.gdeltproject.org/" target="_blank" rel="noopener noreferrer" style={{ color: "#3b82f6" }}>gdeltproject.org</a>
+                          </div>
+                        )}
+                      </div>
+                    )}
+                  </div>
+                );
+              })}
+            </div>
+            <div style={{ marginTop: 16, fontSize: 10, color: "#6b7280", lineHeight: 1.5 }}>
+              Click a country for source details and validation info. By conflict location; US casualties when events identify US as a party.
+            </div>
+            <div style={{ marginTop: 12, padding: 10, background: "#0d0d15", borderRadius: 8, border: "1px solid #2a2a3a", fontSize: 10, color: "#9ca3af", lineHeight: 1.6 }}>
+              <div style={{ fontWeight: 600, color: "#e4e4ef", marginBottom: 6 }}>Compare with news</div>
+              Use BBC Verify, CBS, CNN as benchmarks. Expect differences due to: different time ranges, definitions (confirmed vs estimated), and update timing.
+              <div style={{ marginTop: 6, color: "#f59e0b" }}>
+                GDELT numbers are AI-inferred and unverified — treat as rough indicators, not official counts.
+              </div>
+              {!deathToll.ucdp_available && (
+                <div style={{ marginTop: 6 }}>
+                  Request UCDP API access from <a href="mailto:mertcan.yilmaz@pcr.uu.se" style={{ color: "#3b82f6" }}>UCDP</a> for verified counts.
+                </div>
+              )}
+            </div>
+          </div>
+        </div>
+      )}
 
       {/* ---- Setup hints (dismissible) ---- */}
       {hints.length > 0 && hintsVisible && (
@@ -1149,7 +2137,7 @@ export function App() {
       )}
 
       {/* ---- Filter panel (right) ---- */}
-      <div style={{ position: "absolute", top: 12, right: 12, zIndex: 1000, width: 250 }}>
+      <div style={{ position: "absolute", top: 12, right: 12, zIndex: 1000, width: 320 }}>
         <div
           style={{
             ...panelStyle,
@@ -1180,8 +2168,48 @@ export function App() {
             </Row>
           ))}
 
+          <details
+            open={countryFilterOpen}
+            onToggle={(e) => setCountryFilterOpen((e.target as HTMLDetailsElement).open)}
+            style={{ marginTop: 8, borderTop: "1px solid #2a2a3a", paddingTop: 8 }}
+          >
+            <summary style={{ cursor: "pointer", fontSize: 10, fontWeight: 600, letterSpacing: 1.5, color: "#8888a0", textTransform: "uppercase" }}>
+              Country filter
+            </summary>
+            <div style={{ marginTop: 6, maxHeight: 160, overflowY: "auto" }}>
+              {(() => {
+                const byCountry = new Map<string, number>();
+                for (const ac of aircraft) {
+                  if (ac.country_code) byCountry.set(ac.country_code, (byCountry.get(ac.country_code) ?? 0) + 1);
+                }
+                const countries = [...byCountry.entries()].sort((a, b) => b[1] - a[1]);
+                if (countries.length === 0) return <span style={{ fontSize: 11, color: "#6b7280" }}>No country data</span>;
+                return countries.map(([cc, count]) => (
+                  <Row key={cc}>
+                    <span style={{ display: "flex", alignItems: "center", gap: 6 }}>
+                      <span style={{ fontSize: 14 }}>{countryFlag(cc)}</span>
+                      <span style={{ fontSize: 11 }}>{countryName(cc) || cc}</span>
+                    </span>
+                    <span style={{ display: "flex", alignItems: "center", gap: 6 }}>
+                      <Badge>{count}</Badge>
+                      <input
+                        type="checkbox"
+                        checked={countryFilter[cc] !== false}
+                        onChange={() => toggleCountry(cc)}
+                        style={{ accentColor: "#f59e0b" }}
+                      />
+                    </span>
+                  </Row>
+                ));
+              })()}
+            </div>
+          </details>
+
           <div style={{ borderTop: "1px solid #2a2a3a", marginTop: 4, paddingTop: 8 }}>
-            <div style={sectionTitle}>Conflict Events (GDELT)</div>
+            <div style={sectionTitle}>
+              Conflict Events {strikesEnriched ? "(AI verified)" : "(raw — AI processing...)"}
+              {strikesUpdatedAt && <span style={{ fontWeight: 400, fontSize: 10, color: "#6b7280", marginLeft: 8 }}>{formatUpdatedAgo(strikesUpdatedAt)}</span>}
+            </div>
             <Row>
               <span style={{ display: "flex", alignItems: "center", gap: 8 }}>
                 <span
@@ -1229,8 +2257,87 @@ export function App() {
               </select>
             </div>
             <div style={{ fontSize: 10, color: "#666", marginTop: 4, lineHeight: 1.4 }}>
-              {strikes.length} total reports ({strikes.filter((e) => e.latitude != null).length} geocoded)
+              {strikes.length} verified incidents ({strikes.filter((e) => e.latitude != null).length} geocoded)
             </div>
+            <div style={{ marginTop: 6, display: "flex", flexDirection: "column", gap: 3 }}>
+              {([
+                ["to_iran", "#3b82f6", "Strikes on Iran"],
+                ["from_iran", "#ef4444", "Iranian attacks"],
+                ["internal", "#f59e0b", "Internal unrest"],
+                ["other", "#8b5cf6", "Other regional"],
+              ] as const).map(([, color, label]) => (
+                <div key={label} style={{ display: "flex", alignItems: "center", gap: 6 }}>
+                  <span style={{ width: 8, height: 8, borderRadius: "50%", background: color, display: "inline-block" }} />
+                  <span style={{ fontSize: 10, color: "#b0b0c0" }}>{label}</span>
+                </div>
+              ))}
+            </div>
+            <details style={{ marginTop: 8, fontSize: 10, color: "#6b7280", background: "#0d0d15", border: "1px solid #1a1a2a", borderRadius: 5, padding: 0 }}>
+              <summary style={{ padding: "5px 8px", cursor: "pointer", color: "#8888a0", fontWeight: 600, fontSize: 10, letterSpacing: 0.5 }}>How conflict events work</summary>
+              <div style={{ padding: "6px 8px 8px", lineHeight: 1.6, borderTop: "1px solid #1a1a2a" }}>
+                <div style={{ marginBottom: 4 }}>
+                  <b style={{ color: "#ef4444" }}>1. Ingest</b> — Raw conflict events are pulled from the GDELT Project, which machine-codes news articles into structured event data every 15 minutes.
+                </div>
+                <div style={{ marginBottom: 4 }}>
+                  <b style={{ color: "#ef4444" }}>2. Deduplicate</b> — GDELT often codes the same real-world incident multiple times from different articles. A Databricks-hosted LLM (Claude) groups duplicates that share the same date, location, and actors into single verified incidents.
+                </div>
+                <div style={{ marginBottom: 4 }}>
+                  <b style={{ color: "#ef4444" }}>3. Enrich</b> — The LLM assigns each incident: a human-readable title, severity (1–10), confidence (0–1), attack direction (to/from Iran), and a summary. Events below 0.5 confidence are filtered out as noise.
+                </div>
+                <div style={{ marginBottom: 4 }}>
+                  <b style={{ color: "#ef4444" }}>4. Visualize</b> — Dot size = severity, color = direction, opacity = confidence + recency. Nearby events cluster into grouped markers.
+                </div>
+              </div>
+            </details>
+
+            {news.length > 0 && (
+              <div style={{ marginTop: 12, borderTop: "1px solid #2a2a3a", paddingTop: 10 }}>
+                <div style={{ fontSize: 12, fontWeight: 700, letterSpacing: 1.5, color: "#f59e0b", marginBottom: 3, textTransform: "uppercase" as const }}>
+                  Live Feed
+                </div>
+                <div style={{ fontSize: 10, color: "#6b7280", marginBottom: 8 }}>
+                  Real-time RSS from 10+ sources · newest first · no AI processing (zero cost)
+                </div>
+                <div style={{ maxHeight: 380, overflowY: "auto", paddingRight: 4 }}>
+                  {[...news]
+                    .sort((a, b) => (b.published || "").localeCompare(a.published || ""))
+                    .slice(0, 25)
+                    .map((item, i) => {
+                      const ago = formatPublishedAgo(item.published);
+                      const domain = item.link ? new URL(item.link).hostname.replace("www.", "") : "";
+                      const favicon = domain ? `https://www.google.com/s2/favicons?domain=${domain}&sz=20` : "";
+                      return (
+                        <div key={i} style={{ display: "flex", alignItems: "flex-start", gap: 10, marginBottom: 10, paddingBottom: 10, borderBottom: "1px solid #1a1a2a" }}>
+                          {favicon && <img src={favicon} alt="" width={18} height={18} style={{ flexShrink: 0, marginTop: 2, borderRadius: 3, opacity: 0.9 }} />}
+                          <div style={{ minWidth: 0, flex: 1 }}>
+                            {item.link ? (
+                              <a
+                                href={item.link}
+                                target="_blank"
+                                rel="noopener noreferrer"
+                                style={{ fontSize: 14, color: "#e4e4ef", lineHeight: 1.4, display: "block", textDecoration: "none", fontWeight: 500, wordBreak: "break-word" }}
+                                onMouseEnter={(e) => (e.currentTarget.style.color = "#f59e0b")}
+                                onMouseLeave={(e) => (e.currentTarget.style.color = "#e4e4ef")}
+                              >
+                                {item.title}
+                              </a>
+                            ) : (
+                              <div style={{ fontSize: 14, color: "#e4e4ef", lineHeight: 1.4, fontWeight: 500, wordBreak: "break-word" }}>
+                                {item.title}
+                              </div>
+                            )}
+                            <div style={{ fontSize: 11, color: "#9ca3af", marginTop: 4, display: "flex", alignItems: "center", gap: 6, flexWrap: "wrap" }}>
+                              {ago && <span style={{ color: "#f59e0b", fontWeight: 600 }}>{ago}</span>}
+                              {ago && item.source ? <span style={{ color: "#6b7280" }}>·</span> : null}
+                              {item.source && <span style={{ fontWeight: 500, color: "#b0b0c0" }}>{item.source}</span>}
+                            </div>
+                          </div>
+                        </div>
+                      );
+                    })}
+                </div>
+              </div>
+            )}
           </div>
 
           <div style={{ borderTop: "1px solid #2a2a3a", marginTop: 4, paddingTop: 8 }}>
@@ -1276,7 +2383,7 @@ export function App() {
           >
             Aircraft: adsb.lol + OpenSky · 15s
             <br />
-            Events: GDELT &nbsp;|&nbsp; Bases: OpenStreetMap
+            Events: GDELT → AI &nbsp;|&nbsp; Bases: OpenStreetMap
           </div>
         </div>
       </div>
@@ -1346,7 +2453,8 @@ const thStyle: React.CSSProperties = {
 const tdStyle: React.CSSProperties = {
   padding: "5px 6px",
   fontSize: 11,
-  whiteSpace: "nowrap",
+  overflow: "hidden",
+  textOverflow: "ellipsis",
 };
 
 function D() {

@@ -1,6 +1,0 @@
-command:
-  - uvicorn
-  - backend.app:app
-env:
-  - name: UVICORN_WORKERS
-    value: "1"

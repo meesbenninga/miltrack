@@ -44,12 +44,20 @@ export interface StrikeEvent {
   fatalities: number | null;
   notes: string | null;
   source: string | null;
+  title: string | null;
+  summary: string | null;
+  severity: number | null;
+  confidence: number | null;
+  attack_direction: "to_iran" | "from_iran" | "internal" | "other" | null;
+  hours_ago: number | null;
+  source_url: string | null;
 }
 
 export interface StrikesResponse {
   events: StrikeEvent[];
   total: number;
   cached: boolean;
+  enriched: boolean;
   hint: string | null;
 }
 
@@ -96,12 +104,15 @@ export interface NewsItem {
   published: string | null;
   source: string | null;
   summary: string | null;
+  relevance: number;
 }
 
 export interface NewsResponse {
   items: NewsItem[];
   total: number;
   cached: boolean;
+  sources_ok: number;
+  sources_failed: number;
 }
 
 // --- Country code → flag emoji + name ---
@@ -119,7 +130,7 @@ const COUNTRY_NAMES: Record<string, string> = {
   DE: "Germany", IT: "Italy", ES: "Spain", NL: "Netherlands", BE: "Belgium",
   DK: "Denmark", NO: "Norway", SE: "Sweden", FI: "Finland", PL: "Poland",
   GR: "Greece", PT: "Portugal", CZ: "Czech Rep.", RO: "Romania", HU: "Hungary",
-  BG: "Bulgaria", AT: "Austria", CH: "Switzerland", TR: "Turkey",
+  BG: "Bulgaria", AT: "Austria", CH: "Switzerland", TR: "Turkey", SK: "Slovakia",
   CA: "Canada", AU: "Australia", NZ: "New Zealand", JP: "Japan", KR: "South Korea",
   IN: "India", PK: "Pakistan", CN: "China", TW: "Taiwan", SG: "Singapore",
   MY: "Malaysia", ID: "Indonesia", TH: "Thailand", PH: "Philippines", VN: "Vietnam",
@@ -188,20 +199,98 @@ export async function fetchNews(limit = 50): Promise<NewsResponse> {
   return res.json();
 }
 
+// --- AI Intelligence Feed ---
+
+export interface IntelArticle {
+  title: string;
+  url: string | null;
+  published: string | null;
+  source_domain: string | null;
+  relevance_score: number;
+  category: string | null;
+  entities: {
+    countries?: string[];
+    weapons_platforms?: string[];
+    actors?: string[];
+    locations?: string[];
+  } | null;
+  summary: string | null;
+  map_connection: string | null;
+  hours_ago?: number | null;
+}
+
+export interface IntelResponse {
+  articles: IntelArticle[];
+  total: number;
+  cached: boolean;
+  pipeline_status: Record<string, string> | null;
+  updated_at?: number | null;
+}
+
+export async function fetchIntel(limit = 20): Promise<IntelResponse> {
+  const res = await fetch(`/api/intel?limit=${limit}`);
+  if (!res.ok) throw new Error(`Intel fetch failed: ${res.status}`);
+  return res.json();
+}
+
+// --- AI Situation Report ---
+
+export interface SitrepResponse {
+  threat_level: string;
+  executive_summary: string;
+  aircraft_situation: string;
+  conflict_situation: string;
+  key_developments: string;
+  assessment: string;
+  connections: string | null;
+  generated_at: string;
+  generated_at_ts?: number | null;
+  cached: boolean;
+}
+
+export async function fetchSitrep(): Promise<SitrepResponse> {
+  const res = await fetch("/api/sitrep");
+  if (!res.ok) throw new Error(`SITREP fetch failed: ${res.status}`);
+  return res.json();
+}
+
+// --- Death toll (UCDP + GDELT) ---
+
+export interface DeathTollCountry {
+  country: string;
+  ucdp_best: number | null;
+  ucdp_low: number | null;
+  ucdp_high: number | null;
+  gdelt_total: number | null;
+  source: string;
+}
+
+export interface DeathTollResponse {
+  by_country: DeathTollCountry[];
+  ucdp_available: boolean;
+  period: string;
+}
+
+export async function fetchDeathToll(): Promise<DeathTollResponse> {
+  const res = await fetch("/api/death-toll");
+  if (!res.ok) throw new Error(`Death toll fetch failed: ${res.status}`);
+  return res.json();
+}
+
 // --- Aircraft classification ---
 
 export type MilCategory = "tanker" | "awacs" | "transport" | "recon" | "other";
 
 const TANKER_TYPES = new Set(["K35R", "KC46", "KC10", "K35T", "KC30", "MRTT", "K35E", "KC2T"]);
 const AWACS_TYPES = new Set(["E3TF", "E3CF", "E737", "E767", "E2C", "E2D", "E6B"]);
-const TRANSPORT_TYPES = new Set(["C17", "C5M", "C5", "C130", "C30J", "C160", "A400", "C2"]);
+const TRANSPORT_TYPES = new Set(["C17", "C5M", "C5", "C130", "C30J", "C27J", "C160", "A400", "C2"]);
 const RECON_TYPES = new Set(["RC135", "R135", "EP3", "P8", "RQ4", "MQ9", "MQ4C", "U2"]);
 
 export function classifyAircraft(ac: AircraftPosition): MilCategory {
   const t = ac.aircraft_type?.toUpperCase().replace(/-/g, "") || "";
   if (TANKER_TYPES.has(t) || t.startsWith("KC") || t.startsWith("K35")) return "tanker";
   if (AWACS_TYPES.has(t) || t.startsWith("E3") || t.startsWith("E6")) return "awacs";
-  if (TRANSPORT_TYPES.has(t) || t.startsWith("C17") || t.startsWith("C5") || t.startsWith("C130")) return "transport";
+  if (TRANSPORT_TYPES.has(t) || t.startsWith("C17") || t.startsWith("C5") || t.startsWith("C130") || t.startsWith("C27")) return "transport";
   if (RECON_TYPES.has(t) || t.startsWith("RC") || t.startsWith("RQ") || t.startsWith("MQ") || t.startsWith("P8") || t.startsWith("EP")) return "recon";
   const desc = (ac.description || "").toLowerCase();
   if (desc.includes("tanker") || desc.includes("refuel")) return "tanker";
@@ -216,7 +305,7 @@ export const CATEGORY_META: Record<MilCategory, { color: string; label: string; 
   awacs: { color: "#3b82f6", label: "Radar / Command", desc: "Airborne radar or command post" },
   transport: { color: "#10b981", label: "Cargo / Transport", desc: "Moves troops, equipment, or supplies" },
   recon: { color: "#a855f7", label: "Surveillance", desc: "Gathers intelligence or patrols" },
-  other: { color: "#6b7280", label: "Military", desc: "Other military aircraft" },
+  other: { color: "#6b7280", label: "Other", desc: "Military, gov, or uncategorized" },
 };
 
 export function getAircraftLabel(ac: AircraftPosition): string {
@@ -280,9 +369,12 @@ export function conflictScore(ac: AircraftPosition): ScoreResult {
 
   // 2. Country relevance (0–10)
   if (ac.country_code === "IL") { raw += 10; reasons.push("Israeli"); }
+  else if (ac.country_code === "IR" || ac.country_code === "RU") { raw += 8; reasons.push(ac.country_code === "IR" ? "Iranian" : "Russian"); }
   else if (ac.country_code === "US") { raw += 5; reasons.push("US"); }
-  else if (ac.country_code === "SA" || ac.country_code === "AE") { raw += 6; reasons.push("Gulf state"); }
-  else if (ac.country_code === "GB" || ac.country_code === "FR") { raw += 3; reasons.push("NATO ally"); }
+  else if (["SA", "AE", "BH", "QA", "KW", "OM"].includes(ac.country_code || "")) { raw += 6; reasons.push("Gulf state"); }
+  else if (["IQ", "SY", "LB", "JO", "EG", "LY", "AF"].includes(ac.country_code || "")) { raw += 4; reasons.push("regional actor"); }
+  else if (["GB", "FR", "NO", "SE", "FI", "DK", "BE", "PL", "PT", "GR", "CZ", "RO", "BG", "SK"].includes(ac.country_code || "")) { raw += 3; reasons.push("NATO ally"); }
+  else if (ac.country_code === "CN") { raw += 4; reasons.push("China"); }
 
   // 3. Mission-like behavior (0–10)
   const alt = typeof ac.alt_baro === "number" ? ac.alt_baro : null;
